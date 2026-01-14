@@ -1,118 +1,81 @@
-# database.py
+# auth.py
 from __future__ import annotations
 
-import os
-from datetime import datetime
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Optional
 
-from sqlalchemy import (
-    create_engine,
-    String,
-    Integer,
-    DateTime,
-    Float,
-    ForeignKey,
-    Text,
-    select,
-    func,
-)
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
+import bcrypt
 
-DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
-DB_PATH = DATA_DIR / "app.db"
-DB_URL = os.getenv("DATABASE_URL", f"sqlite:///{DB_PATH.as_posix()}")
-
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-(Path(os.getenv("UPLOAD_DIR", str(DATA_DIR / "uploads")))).mkdir(parents=True, exist_ok=True)
+from database import SessionLocal, init_db, get_user_by_username, User
 
 
-class Base(DeclarativeBase):
-    pass
+ADMIN_DEFAULT_USERNAME = "admin_utara"
+ADMIN_DEFAULT_PASSWORD = "utara2026"
 
 
-class User(Base):
-    __tablename__ = "users"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    username: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
-    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
-    role: Mapped[str] = mapped_column(String(16), nullable=False)  # "admin" | "worker"
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
-
-    receipts: Mapped[list["Receipt"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+@dataclass
+class AuthUser:
+    id: int
+    username: str
+    role: str  # "admin" | "worker"
 
 
-class Receipt(Base):
-    __tablename__ = "receipts"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
-    user: Mapped["User"] = relationship(back_populates="receipts")
-
-    image_filename: Mapped[str] = mapped_column(String(255), nullable=False)
-    image_sha256: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
-
-    # Datos extraídos
-    emitter: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    recipient: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    amount: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    currency: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)  # ARS/PYG
-    date: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)  # ISO recomendado (YYYY-MM-DD)
-    operation_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
-
-    raw_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    extracted_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
-
-    def as_dict(self) -> dict:
-        return {
-            "id": self.id,
-            "user_id": self.user_id,
-            "image_filename": self.image_filename,
-            "image_sha256": self.image_sha256,
-            "emitter": self.emitter,
-            "recipient": self.recipient,
-            "amount": self.amount,
-            "currency": self.currency,
-            "date": self.date,
-            "operation_id": self.operation_id,
-            "created_at": self.created_at.isoformat(),
-            "updated_at": self.updated_at.isoformat(),
-        }
+def hash_password(plain_password: str) -> str:
+    salt = bcrypt.gensalt(rounds=12)
+    hashed = bcrypt.hashpw(plain_password.encode("utf-8"), salt)
+    return hashed.decode("utf-8")
 
 
-engine = create_engine(
-    DB_URL,
-    echo=False,
-    future=True,
-    connect_args={"check_same_thread": False} if DB_URL.startswith("sqlite") else {},
-)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+def verify_password(plain_password: str, password_hash: str) -> bool:
+    try:
+        return bcrypt.checkpw(plain_password.encode("utf-8"), password_hash.encode("utf-8"))
+    except Exception:
+        return False
 
 
-def init_db() -> None:
-    Base.metadata.create_all(engine)
+def ensure_default_admin() -> None:
+    """
+    Crea el admin por defecto si no existe.
+    """
+    init_db()
+    with SessionLocal() as db:
+        existing = get_user_by_username(db, ADMIN_DEFAULT_USERNAME)
+        if existing:
+            return
+        admin = User(
+            username=ADMIN_DEFAULT_USERNAME,
+            password_hash=hash_password(ADMIN_DEFAULT_PASSWORD),
+            role="admin",
+        )
+        db.add(admin)
+        db.commit()
 
 
-def get_user_by_username(db, username: str) -> Optional[User]:
-    return db.execute(select(User).where(User.username == username)).scalar_one_or_none()
+def authenticate(username: str, password: str) -> Optional[AuthUser]:
+    with SessionLocal() as db:
+        user = get_user_by_username(db, username)
+        if not user:
+            return None
+        if not verify_password(password, user.password_hash):
+            return None
+        return AuthUser(id=user.id, username=user.username, role=user.role)
 
 
-def count_receipts_by_user(db) -> list[tuple[str, int]]:
-    # Devuelve (username, count)
-    rows = db.execute(
-        select(User.username, func.count(Receipt.id))
-        .join(Receipt, Receipt.user_id == User.id, isouter=True)
-        .group_by(User.username)
-        .order_by(User.username.asc())
-    ).all()
-    return [(r[0], int(r[1])) for r in rows]
+def create_worker(username: str, password: str) -> None:
+    with SessionLocal() as db:
+        if get_user_by_username(db, username):
+            raise ValueError("El usuario ya existe.")
+        u = User(username=username, password_hash=hash_password(password), role="worker")
+        db.add(u)
+        db.commit()
 
 
-def sha256_exists(db, sha256_hex: str) -> bool:
-    existing = db.execute(select(Receipt.id).where(Receipt.image_sha256 == sha256_hex)).first()
-    return existing is not None
+def delete_user(username: str) -> None:
+    if username == ADMIN_DEFAULT_USERNAME:
+        raise ValueError("No se puede eliminar el administrador por defecto.")
+    with SessionLocal() as db:
+        user = get_user_by_username(db, username)
+        if not user:
+            raise ValueError("Usuario no encontrado.")
+        db.delete(user)
+        db.commit()
