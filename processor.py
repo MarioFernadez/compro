@@ -13,16 +13,11 @@ from typing import Optional
 import numpy as np
 from PIL import Image
 import easyocr
-
-# Gemini (opcional, tolerante a fallos)
-try:
-    import google.generativeai as genai
-except Exception:
-    genai = None
+import requests
 
 
 # =====================================================
-# INICIALIZACIONES GLOBALES (CLAVE PARA NO COLGAR)
+# INICIALIZACIONES GLOBALES
 # =====================================================
 
 # EasyOCR se inicializa UNA SOLA VEZ
@@ -38,8 +33,8 @@ class ExtractedData:
     emitter: Optional[str] = None
     recipient: Optional[str] = None
     amount: Optional[float] = None
-    currency: Optional[str] = None  # ARS / PYG
-    date: Optional[str] = None      # YYYY-MM-DD
+    currency: Optional[str] = None
+    date: Optional[str] = None
     operation_id: Optional[str] = None
 
     raw_text: Optional[str] = None
@@ -65,12 +60,13 @@ def _normalize_currency(text: str) -> Optional[str]:
 
 def _parse_amount(text: str) -> Optional[float]:
     candidates = re.findall(
-        r"(?<!\d)(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})|\d+(?:[.,]\d{2}))(?!\d)",
+        r"(?<!\d)(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})|\$\s?\d+(?:[.,]\d{2}))",
         text,
     )
 
     def to_float(s: str) -> Optional[float]:
         try:
+            s = s.replace("$", "").strip()
             if "," in s and "." in s:
                 if s.rfind(",") > s.rfind("."):
                     s = s.replace(".", "").replace(",", ".")
@@ -88,93 +84,76 @@ def _parse_amount(text: str) -> Optional[float]:
 
 
 def _parse_date(text: str) -> Optional[str]:
-    m = re.search(r"\b(\d{4})[-/](\d{2})[-/](\d{2})\b", text)
+    m = re.search(r"\b(\d{2})\s+de\s+(\w+)\s+de\s+(\d{4})", text, re.IGNORECASE)
     if m:
-        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
-
-    m = re.search(r"\b(\d{2})[/-](\d{2})[/-](\d{4})\b", text)
-    if m:
-        return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
+        months = {
+            "enero": "01", "febrero": "02", "marzo": "03", "abril": "04",
+            "mayo": "05", "junio": "06", "julio": "07", "agosto": "08",
+            "septiembre": "09", "octubre": "10", "noviembre": "11", "diciembre": "12",
+        }
+        return f"{m.group(3)}-{months.get(m.group(2).lower(), '01')}-{m.group(1).zfill(2)}"
 
     return None
 
 
 def _parse_operation_id(text: str) -> Optional[str]:
-    patterns = [
-        r"(?:ID\s*OPERACI[ÓO]N|OPERACI[ÓO]N|TRANSACCI[ÓO]N|COMPROBANTE|AUTORIZACI[ÓO]N)\s*[:#]?\s*([A-Z0-9\-]{6,})",
-        r"\b([A-Z0-9]{10,})\b",
-    ]
-    t = text.upper()
-    for p in patterns:
-        m = re.search(p, t)
-        if m:
-            return m.group(1)
+    m = re.search(r"(N[ÚU]MERO\s+DE\s+OPERACI[ÓO]N.*?)(\d{8,})", text, re.IGNORECASE)
+    if m:
+        return m.group(2)
     return None
 
 
-def _guess_parties(text: str) -> tuple[Optional[str], Optional[str]]:
-    t = text.upper()
-
-    def find(label: str) -> Optional[str]:
-        m = re.search(label + r"\s*[:\-]\s*(.{3,80})", t)
-        if not m:
-            return None
-        val = re.split(r"\b(DNI|CUIT|RUC|ID|OPERACI)\b", m.group(1))[0]
-        return val.title().strip()
-
-    emitter = find("EMISOR") or find("PAGADOR") or find("ORIGEN")
-    recipient = find("DESTINATARIO") or find("BENEFICIARIO") or find("RECEPTOR")
-
-    return emitter, recipient
-
-
 # =====================================================
-# OCR OPTIMIZADO (NO SE CUELGA)
+# OCR
 # =====================================================
 
 def easyocr_extract_text(image: Image.Image) -> str:
-    # Redimensionar imágenes grandes para evitar cuelgues
     max_width = 1600
     if image.width > max_width:
         ratio = max_width / image.width
         image = image.resize((max_width, int(image.height * ratio)))
 
-    image_np = np.array(image)
-
-    result = EASYOCR_READER.readtext(
-        image_np,
-        detail=0,
-        paragraph=True,
+    text = "\n".join(
+        EASYOCR_READER.readtext(np.array(image), detail=0, paragraph=True)
     )
 
-    if isinstance(result, list):
-        return "\n".join([str(x) for x in result if x])
+    # 🔒 LIMPIEZA CLAVE: eliminar horarios
+    text = re.sub(r"\b\d{1,2}:\d{2}\b", "", text)
+    text = re.sub(r"\bhs\b", "", text, flags=re.IGNORECASE)
 
-    return str(result)
+    return text
 
 
 # =====================================================
-# GEMINI (OPCIONAL, BLINDADO)
+# GEMINI VIA REST
 # =====================================================
 
 def gemini_extract_structured(ocr_text: str) -> Optional[dict]:
-    """
-    Usa Gemini SOLO si está disponible.
-    Si falla por modelo, permisos o API, NO rompe el sistema.
-    """
     api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key or genai is None:
+    if not api_key:
+        print("⚠️ GEMINI_API_KEY no definida")
         return None
 
     try:
-        genai.configure(api_key=api_key)
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            "gemini-1.5-flash:generateContent"
+        )
 
-        # Modelo más compatible históricamente
-        model = genai.GenerativeModel("models/gemini-pro")
+        payload = {
+            "contents": [{
+                "parts": [{
+                    "text": f"""
+Extraé datos de este comprobante argentino/paraguayo.
+Respondé SOLO JSON válido.
 
-        prompt = f"""
-Extraé datos de un comprobante (Argentina o Paraguay).
-Respondé SOLO JSON válido con este formato:
+Reglas ESTRICTAS:
+- amount debe ser un MONTO monetario (ignorar horas, fechas, IDs)
+- Priorizar montos con $
+- Elegir el monto mayor
+- NO inventar datos
+
+Formato:
 
 {{
   "emitter": string|null,
@@ -185,18 +164,30 @@ Respondé SOLO JSON válido con este formato:
   "operation_id": string|null
 }}
 
-Texto OCR:
+TEXTO OCR:
 {ocr_text}
-""".strip()
+"""
+                }]
+            }]
+        }
 
-        resp = model.generate_content(prompt)
-        text = (resp.text or "").strip()
+        r = requests.post(
+            f"{url}?key={api_key}",
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=30,
+        )
 
+        if r.status_code != 200:
+            print("❌ Gemini HTTP:", r.text)
+            return None
+
+        text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        print("✅ Gemini ACTIVO")
         return json.loads(text)
 
     except Exception as e:
-        # Falla segura: no rompe la app
-        print("⚠️ Gemini no disponible:", e)
+        print("❌ Gemini ERROR:", e)
         return None
 
 
@@ -208,7 +199,6 @@ def extract_all(image_bytes: bytes) -> ExtractedData:
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
     ocr_text = easyocr_extract_text(image)
-
     data = ExtractedData(raw_text=ocr_text)
 
     structured = gemini_extract_structured(ocr_text)
@@ -223,24 +213,14 @@ def extract_all(image_bytes: bytes) -> ExtractedData:
         data.extracted_json = json.dumps(structured, ensure_ascii=False)
         return data
 
-    # Fallback heurístico (si no hay IA)
+    # fallback
     data.currency = _normalize_currency(ocr_text)
     data.amount = _parse_amount(ocr_text)
     data.date = _parse_date(ocr_text)
     data.operation_id = _parse_operation_id(ocr_text)
-    data.emitter, data.recipient = _guess_parties(ocr_text)
 
     data.extracted_json = json.dumps(
-        {
-            "emitter": data.emitter,
-            "recipient": data.recipient,
-            "amount": data.amount,
-            "currency": data.currency,
-            "date": data.date,
-            "operation_id": data.operation_id,
-            "source": "heuristic_fallback",
-            "extracted_at": datetime.utcnow().isoformat(),
-        },
+        {"source": "fallback", "raw_text": ocr_text},
         ensure_ascii=False,
     )
 
