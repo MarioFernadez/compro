@@ -1,4 +1,3 @@
-# processor.py
 from __future__ import annotations
 
 import hashlib
@@ -11,7 +10,7 @@ from datetime import datetime
 from typing import Optional
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageEnhance
 import easyocr
 import requests
 
@@ -42,7 +41,7 @@ class ExtractedData:
 
 
 # =====================================================
-# UTILIDADES
+# UTILIDADES DE LIMPIEZA Y FALLBACK
 # =====================================================
 
 def sha256_bytes(content: bytes) -> str:
@@ -51,7 +50,8 @@ def sha256_bytes(content: bytes) -> str:
 
 def _normalize_currency(text: str) -> Optional[str]:
     t = text.upper()
-    if any(x in t for x in ["PYG", "GUARANI", "GUARANÍ", "GS", "₲"]):
+    # Prioridad a Paraguay si detecta ueno o Gs
+    if any(x in t for x in ["UENO", "GS", "₲", "GUARAN", "FAMILIAR"]):
         return "PYG"
     if any(x in t for x in ["ARS", "ARG", "PESO", "$"]):
         return "ARS"
@@ -59,135 +59,112 @@ def _normalize_currency(text: str) -> Optional[str]:
 
 
 def _parse_amount(text: str) -> Optional[float]:
-    candidates = re.findall(
-        r"(?<!\d)(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})|\$\s?\d+(?:[.,]\d{2}))",
-        text,
-    )
-
+    # Regex mejorada para detectar montos con puntos de miles (PY) o decimales (AR)
+    candidates = re.findall(r"(?:gs\.?|gs|\$)\s?([\d\.,]{3,})", text, re.IGNORECASE)
+    
     def to_float(s: str) -> Optional[float]:
         try:
-            s = s.replace("$", "").strip()
-            if "," in s and "." in s:
-                if s.rfind(",") > s.rfind("."):
-                    s = s.replace(".", "").replace(",", ".")
+            # Si tiene más de un punto, es probable que sean miles (Paraguay)
+            if s.count('.') >= 1 and ',' not in s:
+                s = s.replace('.', '')
+            # Si tiene coma y punto, estandarizamos a punto decimal
+            elif ',' in s and '.' in s:
+                if s.rfind(',') > s.rfind('.'):
+                    s = s.replace('.', '').replace(',', '.')
                 else:
-                    s = s.replace(",", "")
-            elif "," in s:
-                s = s.replace(",", ".")
+                    s = s.replace(',', '')
+            elif ',' in s:
+                s = s.replace(',', '.')
             return float(s)
-        except Exception:
+        except:
             return None
 
     values = [to_float(c) for c in candidates]
-    values = [v for v in values if v is not None]
-    return max(values) if values else None
-
-
-def _parse_date(text: str) -> Optional[str]:
-    m = re.search(r"\b(\d{2})\s+de\s+(\w+)\s+de\s+(\d{4})", text, re.IGNORECASE)
-    if m:
-        months = {
-            "enero": "01", "febrero": "02", "marzo": "03", "abril": "04",
-            "mayo": "05", "junio": "06", "julio": "07", "agosto": "08",
-            "septiembre": "09", "octubre": "10", "noviembre": "11", "diciembre": "12",
-        }
-        return f"{m.group(3)}-{months.get(m.group(2).lower(), '01')}-{m.group(1).zfill(2)}"
-
-    return None
-
-
-def _parse_operation_id(text: str) -> Optional[str]:
-    m = re.search(r"(N[ÚU]MERO\s+DE\s+OPERACI[ÓO]N.*?)(\d{8,})", text, re.IGNORECASE)
-    if m:
-        return m.group(2)
-    return None
+    valid_values = [v for v in values if v is not None and v > 0]
+    return max(valid_values) if valid_values else None
 
 
 # =====================================================
-# OCR
+# OCR CON PREPROCESAMIENTO
 # =====================================================
 
 def easyocr_extract_text(image: Image.Image) -> str:
+    # --- MEJORA DE IMAGEN PARA FOTOS DE PANTALLA ---
+    # Aumentar contraste y nitidez antes del OCR
+    enhancer = ImageEnhance.Contrast(image)
+    image = enhancer.enhance(1.8)
+    
     max_width = 1600
     if image.width > max_width:
         ratio = max_width / image.width
         image = image.resize((max_width, int(image.height * ratio)))
 
-    text = "\n".join(
-        EASYOCR_READER.readtext(np.array(image), detail=0, paragraph=True)
-    )
+    results = EASYOCR_READER.readtext(np.array(image), detail=0, paragraph=False)
+    text = "\n".join(results)
 
-    # 🔒 LIMPIEZA CLAVE: eliminar horarios
-    text = re.sub(r"\b\d{1,2}:\d{2}\b", "", text)
-    text = re.sub(r"\bhs\b", "", text, flags=re.IGNORECASE)
-
+    # Limpieza de basura común en OCR
+    text = re.sub(r"\b\d{1,2}:\d{2}(?::\d{2})?\b", "", text) # Quitar horas
     return text
 
 
 # =====================================================
-# GEMINI VIA REST
+# GEMINI CON PROMPT UNIVERSAL (PY/AR)
 # =====================================================
 
 def gemini_extract_structured(ocr_text: str) -> Optional[dict]:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        print("⚠️ GEMINI_API_KEY no definida")
         return None
 
     try:
-        url = (
-            "https://generativelanguage.googleapis.com/v1beta/models/"
-            "gemini-1.5-flash:generateContent"
-        )
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
 
-        payload = {
-            "contents": [{
-                "parts": [{
-                    "text": f"""
-Extraé datos de este comprobante argentino/paraguayo.
-Respondé SOLO JSON válido.
+        prompt = f"""
+Actúa como un experto en contabilidad de Argentina y Paraguay. 
+Analiza el texto de este comprobante de transferencia y extrae los datos exactos.
 
-Reglas ESTRICTAS:
-- amount debe ser un MONTO monetario (ignorar horas, fechas, IDs)
-- Priorizar montos con $
-- Elegir el monto mayor
-- NO inventar datos
+REGLAS DE ORO:
+1. 'amount': Busca el monto principal. En Paraguay (Gs.) suele no tener decimales. En Argentina ($) suele tener dos decimales.
+2. 'currency': Si ves "Gs", "Guaranies", "ueno" o "Familiar", es "PYG". Si ves "$" o "Mercado Pago" o "Galicia", es "ARS".
+3. 'recipient': Nombre de la persona o empresa que recibe el dinero.
+4. 'emitter': Nombre de quien envía el dinero.
+5. 'date': Convertir a formato YYYY-MM-DD.
 
-Formato:
+TEXTO DEL COMPROBANTE:
+{ocr_text}
 
+Responde exclusivamente con un objeto JSON:
 {{
   "emitter": string|null,
   "recipient": string|null,
   "amount": number|null,
-  "currency": "ARS"|"PYG"|null,
+  "currency": "ARS"|"PYG",
   "date": "YYYY-MM-DD"|null,
   "operation_id": string|null
 }}
-
-TEXTO OCR:
-{ocr_text}
 """
-                }]
-            }]
+
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "response_mime_type": "application/json"
+            }
         }
 
         r = requests.post(
             f"{url}?key={api_key}",
             json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=30,
+            timeout=30
         )
 
-        if r.status_code != 200:
-            print("❌ Gemini HTTP:", r.text)
-            return None
-
-        text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-        print("✅ Gemini ACTIVO")
-        return json.loads(text)
+        if r.status_code == 200:
+            res_json = r.json()
+            content = res_json["candidates"][0]["content"]["parts"][0]["text"]
+            return json.loads(content)
+        return None
 
     except Exception as e:
-        print("❌ Gemini ERROR:", e)
+        print(f"Error Gemini: {e}")
         return None
 
 
@@ -198,29 +175,29 @@ TEXTO OCR:
 def extract_all(image_bytes: bytes) -> ExtractedData:
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
+    # 1. OCR
     ocr_text = easyocr_extract_text(image)
     data = ExtractedData(raw_text=ocr_text)
 
+    # 2. Intento con Gemini (Cerebro principal)
     structured = gemini_extract_structured(ocr_text)
 
-    if structured:
+    if structured and structured.get("amount"):
         data.emitter = structured.get("emitter")
         data.recipient = structured.get("recipient")
-        data.amount = structured.get("amount")
+        data.amount = float(structured.get("amount"))
         data.currency = structured.get("currency")
         data.date = structured.get("date")
-        data.operation_id = structured.get("operation_id")
+        data.operation_id = str(structured.get("operation_id")) if structured.get("operation_id") else None
         data.extracted_json = json.dumps(structured, ensure_ascii=False)
         return data
 
-    # fallback
-    data.currency = _normalize_currency(ocr_text)
+    # 3. Fallback (Si Gemini falla o no hay internet)
+    data.currency = _normalize_currency(ocr_text) or "ARS"
     data.amount = _parse_amount(ocr_text)
-    data.date = _parse_date(ocr_text)
-    data.operation_id = _parse_operation_id(ocr_text)
-
+    
     data.extracted_json = json.dumps(
-        {"source": "fallback", "raw_text": ocr_text},
+        {"source": "fallback", "amount": data.amount, "currency": data.currency},
         ensure_ascii=False,
     )
 
