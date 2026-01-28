@@ -22,7 +22,10 @@ from processor import sha256_bytes, extract_all
 
 
 APP_TITLE = "UTARA - Gestión de Comprobantes"
-UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "data/uploads"))
+
+# ✅ UPLOAD_DIR absoluto (evita problemas en deploy)
+BASE_DIR = Path(__file__).resolve().parent
+UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", str(BASE_DIR / "data" / "uploads")))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # =========================
@@ -212,7 +215,6 @@ def page_historial(user):
 
     st.header("📚 Historial")
 
-    # ✅ CSS suave para que se vea más prolijo
     st.markdown(
         """
         <style>
@@ -233,19 +235,16 @@ def page_historial(user):
 
     df = pd.DataFrame([r.as_dict() for r in rows])
 
-    # Map username para admin
     if user.role == "admin":
         with SessionLocal() as db:
             users_map = {u.id: u.username for u in db.query(User).all()}
         df.insert(1, "username", df["user_id"].map(users_map))
 
-    # ✅ Columna "archivo" (truncado) para que NO rompa la tabla
     if "image_filename" in df.columns:
         df["archivo"] = df["image_filename"].apply(lambda x: _shorten(x, 55))
     else:
         df["archivo"] = ""
 
-    # ✅ Orden y columnas limpias
     cols = ["id"]
     if "username" in df.columns:
         cols += ["username"]
@@ -281,9 +280,6 @@ def page_historial(user):
         },
     )
 
-    # =========================
-    # ✅ PREVIEW + DESCARGA (PRO)
-    # =========================
     st.divider()
     st.subheader("📷 Ver comprobante")
 
@@ -305,11 +301,23 @@ def page_historial(user):
 
     colA, colB = st.columns([2, 1])
 
+    # ✅ FIX ROBUSTO: usar bytes + try/except (NO crashea)
     with colA:
         if img_path.exists():
-            st.image(str(img_path), caption=rec.image_filename, use_container_width=True)
+            try:
+                img_bytes = img_path.read_bytes()
+                if not img_bytes:
+                    st.warning("La imagen existe pero está vacía (0 bytes).")
+                    st.caption(f"Ruta: {img_path}")
+                else:
+                    st.image(img_bytes, caption=rec.image_filename, use_container_width=True)
+            except Exception as e:
+                st.error("No se pudo abrir la imagen.")
+                st.caption(f"Ruta: {img_path}")
+                st.code(str(e))
         else:
             st.warning("No se encontró la imagen en disco.")
+            st.caption(f"Ruta esperada: {img_path}")
 
     with colB:
         st.write("**Datos**")
@@ -319,27 +327,27 @@ def page_historial(user):
         st.write(f"- Fecha: {rec.date or '-'}")
         st.write(f"- Operación: {rec.operation_id or '-'}")
         st.write(f"- SHA256: {rec.image_sha256[:16] + '…' if rec.image_sha256 else '-'}")
+        st.write(f"- Archivo: {rec.image_filename or '-'}")
 
         if img_path.exists():
-            # MIME según extensión
             ext = img_path.suffix.lower()
             mime = "image/jpeg" if ext in [".jpg", ".jpeg"] else "image/png" if ext == ".png" else "application/octet-stream"
 
-            st.download_button(
-                "⬇️ Descargar comprobante",
-                data=img_path.read_bytes(),
-                file_name=rec.image_filename,
-                mime=mime,
-                use_container_width=True,
-            )
+            try:
+                st.download_button(
+                    "⬇️ Descargar comprobante",
+                    data=img_path.read_bytes(),
+                    file_name=rec.image_filename,
+                    mime=mime,
+                    use_container_width=True,
+                )
+            except Exception as e:
+                st.error("No se pudo preparar la descarga.")
+                st.code(str(e))
 
-    # =========================
-    # Editor + eliminar (tu lógica, pero más usable)
-    # =========================
     st.divider()
     st.subheader("🧾 Editar / Eliminar un registro")
 
-    # Mejor: por defecto el ID seleccionado arriba
     selected_id = st.number_input("ID del registro", min_value=1, step=1, value=int(sel_id))
 
     c1, c2, c3 = st.columns([1, 1, 2])
@@ -387,13 +395,11 @@ def page_historial(user):
 
             st.success("✅ Registro eliminado.")
             time.sleep(0.4)
-            # limpiar editor si estaba sobre ese registro
             if st.session_state.edit_rec_id == int(selected_id):
                 st.session_state.edit_rec_id = None
                 st.session_state.edit_payload = None
             st.rerun()
 
-    # Editor
     if st.session_state.edit_rec_id is not None and st.session_state.edit_payload is not None:
         st.divider()
         st.subheader(f"✏️ Editando ID #{st.session_state.edit_rec_id}")
@@ -445,9 +451,6 @@ def page_historial(user):
             time.sleep(0.35)
             st.rerun()
 
-    # =========================
-    # Exportar a Excel (igual)
-    # =========================
     st.divider()
     st.subheader("📦 Exportar a Excel")
 
@@ -554,11 +557,9 @@ def page_admin(user):
 def main():
     set_page()
 
-    # DB + admin por defecto
     init_db()
     ensure_default_admin()
 
-    # user seguro
     user = st.session_state.get("auth_user")
     if user is None:
         user = require_login()
@@ -574,7 +575,6 @@ def main():
     elif page == "Panel de Admin":
         page_admin(user)
     elif page == "Login":
-        # fallback por si algo raro pasó
         st.session_state.auth_user = None
         st.rerun()
 
