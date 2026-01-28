@@ -200,12 +200,29 @@ def _fetch_receipts_for_user(db, user):
     return rows
 
 
+def _shorten(s: str, n: int = 48) -> str:
+    s = "" if s is None else str(s)
+    return s if len(s) <= n else (s[: n - 1] + "…")
+
+
 def page_historial(user):
     if user is None:
         st.warning("Debés iniciar sesión.")
         return
 
     st.header("📚 Historial")
+
+    # ✅ CSS suave para que se vea más prolijo
+    st.markdown(
+        """
+        <style>
+          div[data-testid="stDataFrame"] { border-radius: 14px; overflow: hidden; }
+          div[data-testid="stDataFrame"] * { font-size: 13px; }
+          div[data-testid="stDataFrame"] td { white-space: nowrap; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
     with SessionLocal() as db:
         rows = _fetch_receipts_for_user(db, user)
@@ -216,71 +233,164 @@ def page_historial(user):
 
     df = pd.DataFrame([r.as_dict() for r in rows])
 
+    # Map username para admin
     if user.role == "admin":
         with SessionLocal() as db:
             users_map = {u.id: u.username for u in db.query(User).all()}
         df.insert(1, "username", df["user_id"].map(users_map))
 
+    # ✅ Columna "archivo" (truncado) para que NO rompa la tabla
+    if "image_filename" in df.columns:
+        df["archivo"] = df["image_filename"].apply(lambda x: _shorten(x, 55))
+    else:
+        df["archivo"] = ""
+
+    # ✅ Orden y columnas limpias
+    cols = ["id"]
+    if "username" in df.columns:
+        cols += ["username"]
+    cols += [
+        "user_id",
+        "emitter",
+        "recipient",
+        "amount",
+        "currency",
+        "date",
+        "operation_id",
+        "archivo",
+        "created_at",
+    ]
+    cols = [c for c in cols if c in df.columns]
+
     st.dataframe(
-        df[
-            [c for c in df.columns if c in (
-                "id","username","user_id","emitter","recipient","amount","currency","date","operation_id","image_filename","created_at"
-            )]
-        ],
+        df[cols],
         use_container_width=True,
         hide_index=True,
+        column_config={
+            "id": st.column_config.NumberColumn("ID", width="small"),
+            "username": st.column_config.TextColumn("Usuario", width="medium"),
+            "user_id": st.column_config.NumberColumn("User ID", width="small"),
+            "emitter": st.column_config.TextColumn("Emisor", width="medium"),
+            "recipient": st.column_config.TextColumn("Receptor", width="medium"),
+            "amount": st.column_config.NumberColumn("Monto", format="%.2f", width="small"),
+            "currency": st.column_config.TextColumn("Moneda", width="small"),
+            "date": st.column_config.TextColumn("Fecha", width="small"),
+            "operation_id": st.column_config.TextColumn("Operación", width="small"),
+            "archivo": st.column_config.TextColumn("Archivo", width="large"),
+            "created_at": st.column_config.TextColumn("Creado", width="medium"),
+        },
     )
 
+    # =========================
+    # ✅ PREVIEW + DESCARGA (PRO)
+    # =========================
+    st.divider()
+    st.subheader("📷 Ver comprobante")
+
+    ids = sorted(df["id"].dropna().astype(int).unique().tolist())
+    sel_id = st.selectbox("Seleccioná un ID", ids, index=0)
+
+    with SessionLocal() as db:
+        rec = db.query(Receipt).filter(Receipt.id == int(sel_id)).first()
+
+    if not rec:
+        st.error("No se encontró el registro.")
+        return
+
+    if user.role != "admin" and rec.user_id != user.id:
+        st.error("No tenés permisos para ver este registro.")
+        return
+
+    img_path = UPLOAD_DIR / (rec.image_filename or "")
+
+    colA, colB = st.columns([2, 1])
+
+    with colA:
+        if img_path.exists():
+            st.image(str(img_path), caption=rec.image_filename, use_container_width=True)
+        else:
+            st.warning("No se encontró la imagen en disco.")
+
+    with colB:
+        st.write("**Datos**")
+        st.write(f"- Emisor: {rec.emitter or '-'}")
+        st.write(f"- Receptor: {rec.recipient or '-'}")
+        st.write(f"- Monto: {rec.amount if rec.amount is not None else '-'} {rec.currency or ''}")
+        st.write(f"- Fecha: {rec.date or '-'}")
+        st.write(f"- Operación: {rec.operation_id or '-'}")
+        st.write(f"- SHA256: {rec.image_sha256[:16] + '…' if rec.image_sha256 else '-'}")
+
+        if img_path.exists():
+            # MIME según extensión
+            ext = img_path.suffix.lower()
+            mime = "image/jpeg" if ext in [".jpg", ".jpeg"] else "image/png" if ext == ".png" else "application/octet-stream"
+
+            st.download_button(
+                "⬇️ Descargar comprobante",
+                data=img_path.read_bytes(),
+                file_name=rec.image_filename,
+                mime=mime,
+                use_container_width=True,
+            )
+
+    # =========================
+    # Editor + eliminar (tu lógica, pero más usable)
+    # =========================
     st.divider()
     st.subheader("🧾 Editar / Eliminar un registro")
 
-    selected_id = st.number_input("ID del registro", min_value=1, step=1)
+    # Mejor: por defecto el ID seleccionado arriba
+    selected_id = st.number_input("ID del registro", min_value=1, step=1, value=int(sel_id))
 
     c1, c2, c3 = st.columns([1, 1, 2])
 
     with c1:
         if st.button("🔎 Cargar para editar"):
             with SessionLocal() as db:
-                rec = db.query(Receipt).filter(Receipt.id == int(selected_id)).first()
-                if not rec:
+                rec2 = db.query(Receipt).filter(Receipt.id == int(selected_id)).first()
+                if not rec2:
                     st.error("No existe ese ID.")
                     return
-                if user.role != "admin" and rec.user_id != user.id:
+                if user.role != "admin" and rec2.user_id != user.id:
                     st.error("No tenés permisos para editar este registro.")
                     return
 
-                st.session_state.edit_rec_id = rec.id
+                st.session_state.edit_rec_id = rec2.id
                 st.session_state.edit_payload = {
-                    "emitter": rec.emitter or "",
-                    "recipient": rec.recipient or "",
-                    "amount": rec.amount if rec.amount is not None else "",
-                    "currency": rec.currency or "",
-                    "date": rec.date or "",
-                    "operation_id": rec.operation_id or "",
+                    "emitter": rec2.emitter or "",
+                    "recipient": rec2.recipient or "",
+                    "amount": rec2.amount if rec2.amount is not None else "",
+                    "currency": rec2.currency or "",
+                    "date": rec2.date or "",
+                    "operation_id": rec2.operation_id or "",
                 }
                 st.rerun()
 
     with c2:
         if st.button("🗑️ Eliminar"):
             with SessionLocal() as db:
-                rec = db.query(Receipt).filter(Receipt.id == int(selected_id)).first()
-                if not rec:
+                rec2 = db.query(Receipt).filter(Receipt.id == int(selected_id)).first()
+                if not rec2:
                     st.error("No existe ese ID.")
                     return
-                if user.role != "admin" and rec.user_id != user.id:
+                if user.role != "admin" and rec2.user_id != user.id:
                     st.error("No tenés permisos para eliminar este registro.")
                     return
 
                 try:
-                    (UPLOAD_DIR / rec.image_filename).unlink(missing_ok=True)
+                    (UPLOAD_DIR / rec2.image_filename).unlink(missing_ok=True)
                 except Exception:
                     pass
 
-                db.delete(rec)
+                db.delete(rec2)
                 db.commit()
 
             st.success("✅ Registro eliminado.")
-            time.sleep(0.5)
+            time.sleep(0.4)
+            # limpiar editor si estaba sobre ese registro
+            if st.session_state.edit_rec_id == int(selected_id):
+                st.session_state.edit_rec_id = None
+                st.session_state.edit_payload = None
             st.rerun()
 
     # Editor
@@ -312,34 +422,50 @@ def page_historial(user):
                 amount_val = None
 
             with SessionLocal() as db:
-                rec = db.query(Receipt).filter(Receipt.id == int(st.session_state.edit_rec_id)).first()
-                if not rec:
+                rec3 = db.query(Receipt).filter(Receipt.id == int(st.session_state.edit_rec_id)).first()
+                if not rec3:
                     st.error("Registro no encontrado.")
                     return
-                if user.role != "admin" and rec.user_id != user.id:
+                if user.role != "admin" and rec3.user_id != user.id:
                     st.error("No tenés permisos.")
                     return
 
-                rec.emitter = emitter.strip() or None
-                rec.recipient = recipient.strip() or None
-                rec.amount = amount_val
-                rec.currency = currency.strip() or None
-                rec.date = date.strip() or None
-                rec.operation_id = operation_id.strip() or None
-                rec.updated_at = datetime.utcnow()
+                rec3.emitter = emitter.strip() or None
+                rec3.recipient = recipient.strip() or None
+                rec3.amount = amount_val
+                rec3.currency = currency.strip() or None
+                rec3.date = date.strip() or None
+                rec3.operation_id = operation_id.strip() or None
+                rec3.updated_at = datetime.utcnow()
                 db.commit()
 
             st.success("✅ Cambios guardados.")
             st.session_state.edit_rec_id = None
             st.session_state.edit_payload = None
-            time.sleep(0.4)
+            time.sleep(0.35)
             st.rerun()
 
+    # =========================
+    # Exportar a Excel (igual)
+    # =========================
     st.divider()
     st.subheader("📦 Exportar a Excel")
 
     export_df = df.copy()
-    preferred_cols = ["id", "username", "user_id", "emitter", "recipient", "amount", "currency", "date", "operation_id", "image_filename", "created_at", "updated_at"]
+    preferred_cols = [
+        "id",
+        "username",
+        "user_id",
+        "emitter",
+        "recipient",
+        "amount",
+        "currency",
+        "date",
+        "operation_id",
+        "image_filename",
+        "created_at",
+        "updated_at",
+    ]
     export_df = export_df[[c for c in preferred_cols if c in export_df.columns]]
 
     file_name = f"comprobantes_{user.username}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx"
@@ -355,6 +481,7 @@ def page_historial(user):
 
 def _df_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Data") -> bytes:
     import io
+
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         df.to_excel(writer, index=False, sheet_name=sheet_name)
