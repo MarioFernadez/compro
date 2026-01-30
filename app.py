@@ -103,7 +103,6 @@ def sidebar_nav(user):
 
     if st.sidebar.button("🚪 Cerrar sesión"):
         st.session_state.auth_user = None
-        # limpiar editor si estaba abierto
         st.session_state.edit_rec_id = None
         st.session_state.edit_payload = None
         st.rerun()
@@ -121,7 +120,6 @@ def save_upload(bytes_data: bytes, original_name: str, sha256_hex: str) -> str:
 
 
 def page_carga(user):
-    # 🔒 si algo raro pasa, no crashear
     if user is None:
         st.warning("Debés iniciar sesión.")
         return
@@ -192,15 +190,14 @@ def page_carga(user):
 
 def _fetch_receipts_for_user(db, user):
     if user.role == "admin":
-        rows = db.query(Receipt).order_by(Receipt.created_at.desc()).all()
-        return rows
-    rows = (
+        return db.query(Receipt).order_by(Receipt.created_at.desc()).all()
+
+    return (
         db.query(Receipt)
         .filter(Receipt.user_id == user.id)
         .order_by(Receipt.created_at.desc())
         .all()
     )
-    return rows
 
 
 def _shorten(s: str, n: int = 48) -> str:
@@ -301,7 +298,6 @@ def page_historial(user):
 
     colA, colB = st.columns([2, 1])
 
-    # ✅ FIX ROBUSTO: usar bytes + try/except (NO crashea)
     with colA:
         if img_path.exists():
             try:
@@ -333,13 +329,13 @@ def page_historial(user):
             ext = img_path.suffix.lower()
             mime = "image/jpeg" if ext in [".jpg", ".jpeg"] else "image/png" if ext == ".png" else "application/octet-stream"
 
+            # ✅ compatible: sin use_container_width
             try:
                 st.download_button(
                     "⬇️ Descargar comprobante",
                     data=img_path.read_bytes(),
                     file_name=rec.image_filename,
                     mime=mime,
-                    use_container_width=True,
                 )
             except Exception as e:
                 st.error("No se pudo preparar la descarga.")
@@ -421,7 +417,6 @@ def page_historial(user):
             ok = st.form_submit_button("Guardar cambios")
 
         if ok:
-            amount_val = None
             try:
                 amount_val = float(str(amount).replace(",", ".").strip())
             except Exception:
