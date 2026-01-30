@@ -310,7 +310,7 @@ def page_historial(user):
                     st.warning("La imagen existe pero está vacía (0 bytes).")
                     st.caption(f"Ruta: {img_path}")
                 else:
-                    st.image(img_bytes, caption=rec.image_filename, use_container_width=True)
+                    st.image(img_bytes, caption=rec.image_filename, use_column_width=True)
             except Exception as e:
                 st.error("No se pudo abrir la imagen.")
                 st.caption(f"Ruta: {img_path}")
