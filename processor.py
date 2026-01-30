@@ -1,4 +1,3 @@
-# processor.py
 from __future__ import annotations
 
 import hashlib
@@ -7,26 +6,25 @@ import json
 import os
 import re
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from datetime import datetime
+from typing import Optional, Dict, Any
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 import easyocr
 import requests
 
 
 # =====================================================
-# INICIALIZACIONES GLOBALES
+# EASYOCR: inicializar UNA sola vez
 # =====================================================
-
-# EasyOCR se inicializa UNA SOLA VEZ
+# Tip: al setear EASYOCR_MODULE_PATH en Dockerfile, los modelos quedan cacheados en /app/.easyocr
 EASYOCR_READER = easyocr.Reader(["es"], gpu=False)
 
 
 # =====================================================
 # MODELO DE DATOS
 # =====================================================
-
 @dataclass
 class ExtractedData:
     emitter: Optional[str] = None
@@ -41,32 +39,45 @@ class ExtractedData:
 
 
 # =====================================================
-# UTILIDADES
+# CACHE SIMPLE EN MEMORIA (evita reprocesos si Streamlit rerun)
 # =====================================================
+_OCR_CACHE: Dict[str, str] = {}
+_CACHE_MAX = 256
+
 
 def sha256_bytes(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
-def _clean_spaces(s: str) -> str:
-    return " ".join((s or "").strip().split())
+def _cache_get(sha: str) -> Optional[str]:
+    return _OCR_CACHE.get(sha)
 
 
-def _looks_like_name(s: str) -> bool:
-    s = _clean_spaces(s)
-    if not s or len(s) < 5:
-        return False
-    # evita agarrar líneas tipo "CUIT/CUIL: 27-..."
-    if re.search(r"\b(CUIT|CUIL|CVU|CBU|BANCO|MERCADO\s+PAGO)\b", s, re.IGNORECASE):
-        return False
-    # debe tener al menos 2 palabras
-    return len(s.split()) >= 2
+def _cache_set(sha: str, text: str) -> None:
+    if sha in _OCR_CACHE:
+        _OCR_CACHE[sha] = text
+        return
+    if len(_OCR_CACHE) >= _CACHE_MAX:
+        # pop un item (FIFO simple)
+        _OCR_CACHE.pop(next(iter(_OCR_CACHE)))
+    _OCR_CACHE[sha] = text
+
+
+# =====================================================
+# NORMALIZADORES / PARSERS
+# =====================================================
+def _normalize_spaces(s: str) -> str:
+    s = s.replace("\r", "\n")
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
 
 
 def _normalize_currency(text: str) -> Optional[str]:
-    t = (text or "").upper()
+    t = text.upper()
     if any(x in t for x in ["PYG", "GUARANI", "GUARANÍ", "GS", "₲"]):
         return "PYG"
+    # En comprobantes AR, casi siempre aparece "$"
     if any(x in t for x in ["ARS", "ARG", "PESO", "$"]):
         return "ARS"
     return None
@@ -74,204 +85,206 @@ def _normalize_currency(text: str) -> Optional[str]:
 
 def _parse_amount(text: str) -> Optional[float]:
     """
+    Toma el monto más grande.
     Soporta:
-    - $ 124.740
-    - 124.740
-    - 124,740 (OCR raro)
-    - 124740
-    - 42.000 / 42,000 / 42.000,00 etc
+      $ 124.740
+      $124,740.50
+      42.000
+      42000
     """
-    if not text:
-        return None
+    t = text.replace("\u202f", " ").replace("\xa0", " ")
 
-    # Preferir montos con $
-    money_candidates = re.findall(r"\$\s*([\d\.,]+)", text)
-    candidates = money_candidates if money_candidates else re.findall(r"(?<!\d)(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?)(?!\d)", text)
+    # candidatos con $ o números grandes con separadores
+    candidates = re.findall(
+        r"(?:\$\s*)?(\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{2})?|\d{4,}(?:[.,]\d{2})?)",
+        t,
+        flags=re.IGNORECASE,
+    )
 
     def to_float(s: str) -> Optional[float]:
         try:
-            s = s.replace(" ", "").strip()
-            # si tiene ambos separadores, decidir por el último como decimal
+            s = s.strip()
+            # si tiene ambos . y , decidir separador decimal por la última aparición
             if "," in s and "." in s:
                 if s.rfind(",") > s.rfind("."):
+                    # 12.345,67 -> 12345.67
                     s = s.replace(".", "").replace(",", ".")
                 else:
+                    # 12,345.67 -> 12345.67
                     s = s.replace(",", "")
-            else:
-                # si tiene un solo separador:
-                # si parece miles (xxx.xxx) sin decimales -> quitar separador
-                if re.match(r"^\d{1,3}(\.\d{3})+$", s):
-                    s = s.replace(".", "")
-                elif re.match(r"^\d{1,3}(,\d{3})+$", s):
+            elif "," in s:
+                # puede ser decimal o miles; si hay 1 coma y 3 dígitos después -> miles
+                if re.search(r",\d{3}\b", s):
                     s = s.replace(",", "")
                 else:
-                    # puede ser decimal con coma
                     s = s.replace(",", ".")
+            elif "." in s:
+                # si hay puntos de miles (1.234.567) -> sacar puntos
+                if re.search(r"\.\d{3}\b", s):
+                    s = s.replace(".", "")
             return float(s)
         except Exception:
             return None
 
     values = [to_float(c) for c in candidates]
-    values = [v for v in values if v is not None and v > 0]
+    values = [v for v in values if v is not None]
+
+    # filtrar valores que parecen horas/IDs (muy chicos)
+    values = [v for v in values if v >= 1.0]
+
     return max(values) if values else None
 
 
 def _parse_date(text: str) -> Optional[str]:
     """
     Soporta:
-    - "05 de enero de 2026"
-    - "Lunes, 05 de enero de 2026 a las ..."
+      '05 de enero de 2026'
+      'Lunes, 05 de enero de 2026'
     """
-    if not text:
+    m = re.search(r"\b(\d{1,2})\s+de\s+(\w+)\s+de\s+(\d{4})\b", text, re.IGNORECASE)
+    if not m:
         return None
 
-    m = re.search(r"\b(\d{1,2})\s+de\s+([a-záéíóúñ]+)\s+de\s+(\d{4})\b", text, re.IGNORECASE)
-    if m:
-        months = {
-            "enero": "01", "febrero": "02", "marzo": "03", "abril": "04",
-            "mayo": "05", "junio": "06", "julio": "07", "agosto": "08",
-            "septiembre": "09", "setiembre": "09",  # OCR suele variar
-            "octubre": "10", "noviembre": "11", "diciembre": "12",
-        }
-        day = str(m.group(1)).zfill(2)
-        month = months.get(m.group(2).lower(), "01")
-        year = m.group(3)
-        return f"{year}-{month}-{day}"
-
-    return None
+    months = {
+        "enero": "01", "febrero": "02", "marzo": "03", "abril": "04",
+        "mayo": "05", "junio": "06", "julio": "07", "agosto": "08",
+        "septiembre": "09", "setiembre": "09",
+        "octubre": "10", "noviembre": "11", "diciembre": "12",
+    }
+    dd = m.group(1).zfill(2)
+    mm = months.get(m.group(2).lower(), "01")
+    yyyy = m.group(3)
+    return f"{yyyy}-{mm}-{dd}"
 
 
 def _parse_operation_id(text: str) -> Optional[str]:
     """
-    Mercado Pago suele traer:
-    - "Número de operación de Mercado Pago"
-    y debajo un número.
+    Mercado Pago suele decir:
+      'Número de operación de Mercado Pago 140076...'
     """
-    if not text:
-        return None
-
-    # Caso 1: número en misma línea o siguiente
     patterns = [
-        r"N[ÚU]MERO\s+DE\s+OPERACI[ÓO]N(?:\s+DE\s+MERCADO\s+PAGO)?\s*[:\-]?\s*(\d{6,})",
-        r"NUMERO\s+DE\s+OPERACION(?:\s+DE\s+MERCADO\s+PAGO)?\s*[:\-]?\s*(\d{6,})",
+        r"N[ÚU]MERO\s+DE\s+OPERACI[ÓO]N(?:\s+DE\s+MERCADO\s+PAGO)?\s*[:\-]?\s*(\d{8,})",
+        r"OPERACI[ÓO]N\s*[:\-]?\s*(\d{8,})",
+        r"ID\s+OPERACI[ÓO]N\s*[:\-]?\s*(\d{8,})",
     ]
     for p in patterns:
         m = re.search(p, text, re.IGNORECASE)
         if m:
             return m.group(1)
-
-    # Caso 2: detecta el bloque y agarra el primer número largo después
-    m2 = re.search(r"N[ÚU]MERO\s+DE\s+OPERACI[ÓO]N(?:\s+DE\s+MERCADO\s+PAGO)?", text, re.IGNORECASE)
-    if m2:
-        tail = text[m2.end():]
-        m3 = re.search(r"\b(\d{6,})\b", tail)
-        if m3:
-            return m3.group(1)
-
     return None
 
 
-# =====================================================
-# EXTRA: EMISOR / RECEPTOR Mercado Pago (De / Para)
-# =====================================================
+def _clean_name_line(s: str) -> str:
+    s = s.strip()
+    s = re.sub(r"^[•\-\–\*]+\s*", "", s)
+    # cortar si vienen datos luego del nombre
+    s = re.split(r"\b(CUIT|CUIL|CBU|CVU|BANCO|MERCADO\s+PAGO|N[ÚU]MERO|CODIGO|C[ÓO]DIGO|ID)\b", s, flags=re.IGNORECASE)[0]
+    s = re.sub(r"\s{2,}", " ", s).strip(" -:•")
+    return s.strip()
 
-def _split_lines(text: str):
-    return [l.strip() for l in (text or "").splitlines() if l.strip()]
 
-
-def _extract_name_after_label(lines, label_regex: re.Pattern) -> Optional[str]:
+def _parse_emitter_recipient(text: str) -> tuple[Optional[str], Optional[str]]:
     """
-    Busca línea que sea "De" o "Para" y retorna el nombre en la misma línea
-    o en la siguiente línea.
+    Busca bloques:
+      De
+      Nombre Apellido
+    y
+      Para
+      Nombre Apellido
     """
-    for i, line in enumerate(lines):
-        if label_regex.fullmatch(line.strip()):
-            # nombre suele estar justo abajo
-            if i + 1 < len(lines) and _looks_like_name(lines[i + 1]):
-                return _clean_spaces(lines[i + 1])
-        # a veces OCR junta: "De Sandra Gabriela Diaz"
-        m = re.match(r"^(De|Para)\s+(.+)$", line, re.IGNORECASE)
+    t = _normalize_spaces(text)
+
+    # 1) patrones tipo:
+    #   De
+    #   Sandra Gabriela Diaz
+    de_patterns = [
+        r"\bDe\b\s*[:\-]?\s*\n\s*([^\n]{3,80})",
+        r"\bDe\b\s*[:\-]?\s*([^\n]{3,80})",
+    ]
+    para_patterns = [
+        r"\bPara\b\s*[:\-]?\s*\n\s*([^\n]{3,80})",
+        r"\bPara\b\s*[:\-]?\s*([^\n]{3,80})",
+    ]
+
+    emitter = None
+    recipient = None
+
+    for p in de_patterns:
+        m = re.search(p, t, re.IGNORECASE)
         if m:
-            cand = _clean_spaces(m.group(2))
-            if _looks_like_name(cand):
-                return cand
-    return None
+            candidate = _clean_name_line(m.group(1))
+            if candidate and len(candidate.split()) >= 2:
+                emitter = candidate
+                break
 
-
-def _extract_two_people_by_cuit(lines) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Fallback: si OCR no detecta bien "De/Para" pero hay dos personas con CUIT/CUIL.
-    Toma primera como emisor y segunda como receptor.
-    """
-    person_pattern = re.compile(
-        r"^([A-ZÁÉÍÓÚÑ][A-Za-zÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][A-Za-zÁÉÍÓÚÑáéíóúñ]+)+)\s+.*?(CUIT|CUIL|CUIT/CUIL|CUITCUIL|CUITCUIl)[:\s]*\d{2}[- ]?\d{8}[- ]?\d\b",
-        re.IGNORECASE,
-    )
-
-    persons = []
-    for line in lines:
-        line2 = line.replace("Cuitcuil", "CUIT/CUIL").replace("CuitCUIL", "CUIT/CUIL")
-        m = person_pattern.search(line2)
+    for p in para_patterns:
+        m = re.search(p, t, re.IGNORECASE)
         if m:
-            name = _clean_spaces(m.group(1))
-            if _looks_like_name(name):
-                persons.append(name)
+            candidate = _clean_name_line(m.group(1))
+            if candidate and len(candidate.split()) >= 2:
+                recipient = candidate
+                break
 
-    if len(persons) >= 2:
-        return persons[0], persons[1]
-    return None, None
+    # 2) Fallback extra: si OCR metió todo en una sola línea con "De Sandra..." / "Para Romina..."
+    if not emitter:
+        m = re.search(r"\bDe\b\s+([A-ZÁÉÍÓÚÑ][^\n]{3,80})", t, re.IGNORECASE)
+        if m:
+            c = _clean_name_line(m.group(1))
+            if c and len(c.split()) >= 2:
+                emitter = c
 
+    if not recipient:
+        m = re.search(r"\bPara\b\s+([A-ZÁÉÍÓÚÑ][^\n]{3,80})", t, re.IGNORECASE)
+        if m:
+            c = _clean_name_line(m.group(1))
+            if c and len(c.split()) >= 2:
+                recipient = c
 
-def extract_emitter_recipient_from_text(text: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Estrategia:
-    1) Buscar labels "De" y "Para"
-    2) Si no, buscar 2 personas con CUIT/CUIL
-    """
-    lines = _split_lines(text)
+    # Evitar que devuelva "Mercado Pago" como nombre
+    if emitter and re.search(r"mercado\s+pago", emitter, re.IGNORECASE):
+        emitter = None
+    if recipient and re.search(r"mercado\s+pago", recipient, re.IGNORECASE):
+        recipient = None
 
-    # 1) "De" y "Para"
-    emitter = _extract_name_after_label(lines, re.compile(r"^De$", re.IGNORECASE))
-    recipient = _extract_name_after_label(lines, re.compile(r"^Para$", re.IGNORECASE))
-
-    if emitter or recipient:
-        return emitter, recipient
-
-    # 2) fallback por CUIT/CUIL
-    return _extract_two_people_by_cuit(lines)
+    return emitter, recipient
 
 
 # =====================================================
-# OCR
+# OCR (rápido)
 # =====================================================
-
 def easyocr_extract_text(image: Image.Image) -> str:
-    max_width = 1600
+    """
+    Optimizado para CPU:
+    - Reduce resolución (mucho más rápido)
+    - Grayscale + autocontrast (mejora lectura)
+    """
+    max_width = 1100  # 🔥 antes 1600, esto acelera fuerte
     if image.width > max_width:
         ratio = max_width / image.width
         image = image.resize((max_width, int(image.height * ratio)))
 
-    text = "\n".join(
-        EASYOCR_READER.readtext(np.array(image), detail=0, paragraph=True)
-    )
+    # preproceso
+    img = image.convert("L")
+    img = ImageOps.autocontrast(img)
 
-    # 🔒 LIMPIEZA CLAVE: eliminar horarios (no son IDs ni montos)
+    # OCR
+    lines = EASYOCR_READER.readtext(np.array(img), detail=0, paragraph=True)
+
+    text = "\n".join(lines)
+    text = _normalize_spaces(text)
+
+    # limpieza: eliminar horarios típicos
     text = re.sub(r"\b\d{1,2}:\d{2}\b", "", text)
     text = re.sub(r"\bhs\b", "", text, flags=re.IGNORECASE)
-
-    # normalizar variantes comunes de OCR
-    text = text.replace("Cuitcuil", "CUIT/CUIL").replace("CuitCUIL", "CUIT/CUIL").replace("CuitCuil", "CUIT/CUIL")
-    return text
+    return _normalize_spaces(text)
 
 
 # =====================================================
-# GEMINI VIA REST
+# GEMINI VIA REST (opcional)
 # =====================================================
-
 def gemini_extract_structured(ocr_text: str) -> Optional[dict]:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        # silencioso para producción
         return None
 
     try:
@@ -284,17 +297,16 @@ def gemini_extract_structured(ocr_text: str) -> Optional[dict]:
             "contents": [{
                 "parts": [{
                     "text": f"""
-Extraé datos de un comprobante (Mercado Pago / Argentina / Paraguay).
+Extraé datos de este comprobante argentino/paraguayo.
 Respondé SOLO JSON válido.
 
-Reglas ESTRICTAS:
-- amount: monto monetario principal (priorizar el que tenga $ o sea el más grande).
-- NO inventar datos.
-- Si el comprobante trae secciones "De" y "Para", ahí están emisor y receptor.
-- operation_id suele estar en "Número de operación".
+Reglas:
+- amount debe ser un MONTO monetario (ignorar horas, fechas, IDs)
+- Priorizar montos con $
+- Elegir el monto mayor
+- NO inventar datos
 
 Formato:
-
 {{
   "emitter": string|null,
   "recipient": string|null,
@@ -315,7 +327,7 @@ TEXTO OCR:
             f"{url}?key={api_key}",
             json=payload,
             headers={"Content-Type": "application/json"},
-            timeout=30,
+            timeout=10,  # ✅ menor timeout para que no "cuelgue"
         )
 
         if r.status_code != 200:
@@ -331,44 +343,54 @@ TEXTO OCR:
 # =====================================================
 # PIPELINE PRINCIPAL
 # =====================================================
-
 def extract_all(image_bytes: bytes) -> ExtractedData:
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    img_sha = sha256_bytes(image_bytes)
 
-    ocr_text = easyocr_extract_text(image)
+    cached = _cache_get(img_sha)
+    if cached is not None:
+        ocr_text = cached
+    else:
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        ocr_text = easyocr_extract_text(image)
+        _cache_set(img_sha, ocr_text)
+
     data = ExtractedData(raw_text=ocr_text)
 
-    # ✅ Reglas locales primero (rápido y estable)
-    rule_emitter, rule_recipient = extract_emitter_recipient_from_text(ocr_text)
-    rule_amount = _parse_amount(ocr_text)
-    rule_currency = _normalize_currency(ocr_text)
-    rule_date = _parse_date(ocr_text)
-    rule_operation_id = _parse_operation_id(ocr_text)
+    # 1) Primero: heurísticas rápidas (MercadoPago De/Para)
+    emitter, recipient = _parse_emitter_recipient(ocr_text)
+    data.emitter = emitter
+    data.recipient = recipient
 
-    # Luego Gemini (si existe)
+    # 2) Monto / moneda / fecha / operación (rápido)
+    data.currency = _normalize_currency(ocr_text)
+    data.amount = _parse_amount(ocr_text)
+    data.date = _parse_date(ocr_text)
+    data.operation_id = _parse_operation_id(ocr_text)
+
+    # 3) Si hay Gemini y querés mejorar, lo usamos (pero sin bloquear si falla)
     structured = gemini_extract_structured(ocr_text)
-
     if structured:
-        data.emitter = structured.get("emitter") or rule_emitter
-        data.recipient = structured.get("recipient") or rule_recipient
-        data.amount = structured.get("amount") if structured.get("amount") is not None else rule_amount
-        data.currency = structured.get("currency") or rule_currency
-        data.date = structured.get("date") or rule_date
-        data.operation_id = structured.get("operation_id") or rule_operation_id
+        # Solo pisa si trae algo mejor
+        data.emitter = structured.get("emitter") or data.emitter
+        data.recipient = structured.get("recipient") or data.recipient
+        data.amount = structured.get("amount") if structured.get("amount") is not None else data.amount
+        data.currency = structured.get("currency") or data.currency
+        data.date = structured.get("date") or data.date
+        data.operation_id = structured.get("operation_id") or data.operation_id
         data.extracted_json = json.dumps(structured, ensure_ascii=False)
         return data
 
-    # fallback 100% reglas
-    data.emitter = rule_emitter
-    data.recipient = rule_recipient
-    data.amount = rule_amount
-    data.currency = rule_currency
-    data.date = rule_date
-    data.operation_id = rule_operation_id
-
     data.extracted_json = json.dumps(
-        {"source": "rules_fallback", "raw_text": ocr_text},
+        {
+            "source": "fallback_fast",
+            "emitter": data.emitter,
+            "recipient": data.recipient,
+            "amount": data.amount,
+            "currency": data.currency,
+            "date": data.date,
+            "operation_id": data.operation_id,
+        },
         ensure_ascii=False,
     )
-
     return data
+W

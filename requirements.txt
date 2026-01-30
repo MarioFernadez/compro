@@ -7,9 +7,7 @@ numpy
 pillow
 requests
 
-# OCR
 easyocr==1.7.1
 
-# Torch CPU prebuilt (clave para Railway)
 torch==2.2.2+cpu
 torchvision==0.17.2+cpu
