@@ -393,4 +393,3 @@ def extract_all(image_bytes: bytes) -> ExtractedData:
         ensure_ascii=False,
     )
     return data
-W
