@@ -27,9 +27,6 @@ RUN pip install --no-cache-dir --upgrade pip \
 
 COPY . .
 
-# ✅ PRE-CACHE EasyOCR (descarga/carga modelos en BUILD, no en runtime)
-RUN python -c "import os; os.makedirs('/app/.easyocr', exist_ok=True); import easyocr; easyocr.Reader(['es'], gpu=False)"
-
 EXPOSE 8501
 
 # ✅ Railway suele setear PORT; si no, usa 8501
