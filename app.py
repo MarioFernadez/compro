@@ -23,13 +23,12 @@ from processor import sha256_bytes, extract_all
 
 APP_TITLE = "UTARA - Gestión de Comprobantes"
 
-# ✅ UPLOAD_DIR absoluto (evita problemas en deploy)
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", str(BASE_DIR / "data" / "uploads")))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # =========================
-# Inicialización segura de sesión (CRÍTICO)
+# Session init
 # =========================
 if "auth_user" not in st.session_state:
     st.session_state.auth_user = None
@@ -40,18 +39,10 @@ if "edit_payload" not in st.session_state:
 
 
 def set_page():
-    st.set_page_config(
-        page_title=APP_TITLE,
-        page_icon="🧾",
-        layout="wide",
-    )
+    st.set_page_config(page_title=APP_TITLE, page_icon="🧾", layout="wide")
 
 
 def require_login():
-    """
-    Fuerza login: si no hay usuario autenticado, muestra el formulario.
-    Si se autentica, setea st.session_state.auth_user y rerun.
-    """
     if st.session_state.auth_user is None:
         st.title("🔐 Inicio de sesión")
         st.caption("Acceso restringido. Iniciá sesión para continuar.")
@@ -66,7 +57,6 @@ def require_login():
             if not user:
                 st.error("Credenciales inválidas.")
                 st.stop()
-
             st.session_state.auth_user = user
             st.rerun()
 
@@ -76,13 +66,8 @@ def require_login():
 
 
 def sidebar_nav(user):
-    """
-    Sidebar robusta: nunca asume user != None.
-    Si no hay sesión, manda a Login (no crashea).
-    """
     st.sidebar.title("🧭 Navegación")
 
-    # 🔒 Protección absoluta
     if user is None:
         st.sidebar.warning("No hay sesión activa.")
         if st.sidebar.button("Ir a Login"):
@@ -114,8 +99,7 @@ def save_upload(bytes_data: bytes, original_name: str, sha256_hex: str) -> str:
     safe_name = "".join(c for c in original_name if c.isalnum() or c in ("-", "_", ".", " "))
     safe_name = safe_name.strip().replace(" ", "_")
     filename = f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{sha256_hex[:12]}_{safe_name}"
-    path = UPLOAD_DIR / filename
-    path.write_bytes(bytes_data)
+    (UPLOAD_DIR / filename).write_bytes(bytes_data)
     return filename
 
 
@@ -127,65 +111,79 @@ def page_carga(user):
     st.header("📤 Carga de comprobantes")
 
     st.info(
-        "Subí una imagen (JPG/PNG). El sistema detecta duplicados por SHA-256, hace OCR (EasyOCR) y estructura datos con Gemini (si hay API key)."
+        "Subí imágenes (JPG/PNG). Se detectan duplicados por SHA-256. "
+        "OCR optimizado (recortes + preprocesado) para Mercado Pago."
     )
 
-    uploaded = st.file_uploader("Seleccioná un comprobante", type=["jpg", "jpeg", "png"])
-    if not uploaded:
+    # ✅ MULTIUPLOAD
+    uploads = st.file_uploader(
+        "Seleccioná comprobantes",
+        type=["jpg", "jpeg", "png"],
+        accept_multiple_files=True,
+    )
+    if not uploads:
         return
 
-    img_bytes = uploaded.read()
-    sha = sha256_bytes(img_bytes)
+    start_btn = st.button("🚀 Procesar archivos", use_container_width=True)
 
-    with SessionLocal() as db:
-        if sha256_exists(db, sha):
-            st.error("🚫 Este comprobante ya fue cargado antes (duplicado detectado por SHA-256).")
-            st.code(sha)
-            return
+    if not start_btn:
+        st.caption("Cuando termines de seleccionar, tocá **Procesar archivos**.")
+        return
 
-    with st.spinner("Procesando (OCR + extracción)..."):
-        data = extract_all(img_bytes)
+    progress = st.progress(0)
+    status = st.empty()
 
-    filename = save_upload(img_bytes, uploaded.name, sha)
+    total = len(uploads)
+    ok_count = 0
+    dup_count = 0
+    fail_count = 0
 
-    with SessionLocal() as db:
-        rec = Receipt(
-            user_id=user.id,
-            image_filename=filename,
-            image_sha256=sha,
-            emitter=data.emitter,
-            recipient=data.recipient,
-            amount=data.amount,
-            currency=data.currency,
-            date=data.date,
-            operation_id=data.operation_id,
-            raw_text=data.raw_text,
-            extracted_json=data.extracted_json,
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow(),
-        )
-        db.add(rec)
-        db.commit()
+    for idx, uploaded in enumerate(uploads, start=1):
+        try:
+            status.write(f"Procesando {idx}/{total}: **{uploaded.name}**")
+            img_bytes = uploaded.read()
+            sha = sha256_bytes(img_bytes)
 
-    st.success("✅ Comprobante cargado y procesado.")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("Datos extraídos")
-        st.json(
-            {
-                "emitter": data.emitter,
-                "recipient": data.recipient,
-                "amount": data.amount,
-                "currency": data.currency,
-                "date": data.date,
-                "operation_id": data.operation_id,
-                "sha256": sha,
-                "file": filename,
-            }
-        )
-    with col2:
-        st.subheader("Texto OCR (debug)")
-        st.text_area("OCR", value=(data.raw_text or "")[:8000], height=260)
+            with SessionLocal() as db:
+                if sha256_exists(db, sha):
+                    dup_count += 1
+                    progress.progress(int(idx / total * 100))
+                    continue
+
+            # OCR + extracción
+            data = extract_all(img_bytes)
+
+            filename = save_upload(img_bytes, uploaded.name, sha)
+
+            with SessionLocal() as db:
+                rec = Receipt(
+                    user_id=user.id,
+                    image_filename=filename,
+                    image_sha256=sha,
+                    emitter=data.emitter,
+                    recipient=data.recipient,
+                    amount=data.amount,
+                    currency=data.currency,
+                    date=data.date,
+                    operation_id=data.operation_id,
+                    raw_text=data.raw_text,
+                    extracted_json=data.extracted_json,
+                    created_at=datetime.utcnow(),
+                    updated_at=datetime.utcnow(),
+                )
+                db.add(rec)
+                db.commit()
+
+            ok_count += 1
+
+        except Exception as e:
+            fail_count += 1
+            st.error(f"Error procesando {uploaded.name}: {e}")
+
+        progress.progress(int(idx / total * 100))
+
+    status.empty()
+    st.success(f"✅ Listo. Cargados: {ok_count} | Duplicados: {dup_count} | Fallidos: {fail_count}")
 
 
 def _fetch_receipts_for_user(db, user):
@@ -302,14 +300,12 @@ def page_historial(user):
         if img_path.exists():
             try:
                 img_bytes = img_path.read_bytes()
-                if not img_bytes:
-                    st.warning("La imagen existe pero está vacía (0 bytes).")
-                    st.caption(f"Ruta: {img_path}")
-                else:
+                if img_bytes:
                     st.image(img_bytes, caption=rec.image_filename, use_column_width=True)
+                else:
+                    st.warning("La imagen existe pero está vacía (0 bytes).")
             except Exception as e:
                 st.error("No se pudo abrir la imagen.")
-                st.caption(f"Ruta: {img_path}")
                 st.code(str(e))
         else:
             st.warning("No se encontró la imagen en disco.")
@@ -328,123 +324,12 @@ def page_historial(user):
         if img_path.exists():
             ext = img_path.suffix.lower()
             mime = "image/jpeg" if ext in [".jpg", ".jpeg"] else "image/png" if ext == ".png" else "application/octet-stream"
-
-            # ✅ compatible: sin use_container_width
-            try:
-                st.download_button(
-                    "⬇️ Descargar comprobante",
-                    data=img_path.read_bytes(),
-                    file_name=rec.image_filename,
-                    mime=mime,
-                )
-            except Exception as e:
-                st.error("No se pudo preparar la descarga.")
-                st.code(str(e))
-
-    st.divider()
-    st.subheader("🧾 Editar / Eliminar un registro")
-
-    selected_id = st.number_input("ID del registro", min_value=1, step=1, value=int(sel_id))
-
-    c1, c2, c3 = st.columns([1, 1, 2])
-
-    with c1:
-        if st.button("🔎 Cargar para editar"):
-            with SessionLocal() as db:
-                rec2 = db.query(Receipt).filter(Receipt.id == int(selected_id)).first()
-                if not rec2:
-                    st.error("No existe ese ID.")
-                    return
-                if user.role != "admin" and rec2.user_id != user.id:
-                    st.error("No tenés permisos para editar este registro.")
-                    return
-
-                st.session_state.edit_rec_id = rec2.id
-                st.session_state.edit_payload = {
-                    "emitter": rec2.emitter or "",
-                    "recipient": rec2.recipient or "",
-                    "amount": rec2.amount if rec2.amount is not None else "",
-                    "currency": rec2.currency or "",
-                    "date": rec2.date or "",
-                    "operation_id": rec2.operation_id or "",
-                }
-                st.rerun()
-
-    with c2:
-        if st.button("🗑️ Eliminar"):
-            with SessionLocal() as db:
-                rec2 = db.query(Receipt).filter(Receipt.id == int(selected_id)).first()
-                if not rec2:
-                    st.error("No existe ese ID.")
-                    return
-                if user.role != "admin" and rec2.user_id != user.id:
-                    st.error("No tenés permisos para eliminar este registro.")
-                    return
-
-                try:
-                    (UPLOAD_DIR / rec2.image_filename).unlink(missing_ok=True)
-                except Exception:
-                    pass
-
-                db.delete(rec2)
-                db.commit()
-
-            st.success("✅ Registro eliminado.")
-            time.sleep(0.4)
-            if st.session_state.edit_rec_id == int(selected_id):
-                st.session_state.edit_rec_id = None
-                st.session_state.edit_payload = None
-            st.rerun()
-
-    if st.session_state.edit_rec_id is not None and st.session_state.edit_payload is not None:
-        st.divider()
-        st.subheader(f"✏️ Editando ID #{st.session_state.edit_rec_id}")
-
-        payload = st.session_state.edit_payload or {}
-        with st.form("edit_form"):
-            emitter = st.text_input("Emisor", value=payload.get("emitter", ""))
-            recipient = st.text_input("Destinatario", value=payload.get("recipient", ""))
-            amount = st.text_input("Monto", value=str(payload.get("amount", "")))
-
-            curr = payload.get("currency", "")
-            if curr not in ["ARS", "PYG"]:
-                curr = ""
-
-            currency = st.selectbox("Moneda", ["", "ARS", "PYG"], index=["", "ARS", "PYG"].index(curr))
-            date = st.text_input("Fecha (YYYY-MM-DD)", value=payload.get("date", ""))
-            operation_id = st.text_input("ID Operación", value=payload.get("operation_id", ""))
-
-            ok = st.form_submit_button("Guardar cambios")
-
-        if ok:
-            try:
-                amount_val = float(str(amount).replace(",", ".").strip())
-            except Exception:
-                amount_val = None
-
-            with SessionLocal() as db:
-                rec3 = db.query(Receipt).filter(Receipt.id == int(st.session_state.edit_rec_id)).first()
-                if not rec3:
-                    st.error("Registro no encontrado.")
-                    return
-                if user.role != "admin" and rec3.user_id != user.id:
-                    st.error("No tenés permisos.")
-                    return
-
-                rec3.emitter = emitter.strip() or None
-                rec3.recipient = recipient.strip() or None
-                rec3.amount = amount_val
-                rec3.currency = currency.strip() or None
-                rec3.date = date.strip() or None
-                rec3.operation_id = operation_id.strip() or None
-                rec3.updated_at = datetime.utcnow()
-                db.commit()
-
-            st.success("✅ Cambios guardados.")
-            st.session_state.edit_rec_id = None
-            st.session_state.edit_payload = None
-            time.sleep(0.35)
-            st.rerun()
+            st.download_button(
+                "⬇️ Descargar comprobante",
+                data=img_path.read_bytes(),
+                file_name=rec.image_filename,
+                mime=mime,
+            )
 
     st.divider()
     st.subheader("📦 Exportar a Excel")
@@ -479,22 +364,17 @@ def page_historial(user):
 
 def _df_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Data") -> bytes:
     import io
-
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         df.to_excel(writer, index=False, sheet_name=sheet_name)
-
         wb = writer.book
         ws = writer.sheets[sheet_name]
-
         header_fmt = wb.add_format({"bold": True})
         for col, name in enumerate(df.columns):
             ws.write(0, col, name, header_fmt)
             width = max(10, min(40, int(df[name].astype(str).str.len().max() if not df.empty else 10)))
             ws.set_column(col, col, width)
-
         ws.freeze_panes(1, 0)
-
     output.seek(0)
     return output.read()
 
