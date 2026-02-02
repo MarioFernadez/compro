@@ -33,8 +33,6 @@ if "auth_user" not in st.session_state:
     st.session_state.auth_user = None
 if "edit_rec_id" not in st.session_state:
     st.session_state.edit_rec_id = None
-if "edit_payload" not in st.session_state:
-    st.session_state.edit_payload = None
 
 
 def set_page():
@@ -88,7 +86,6 @@ def sidebar_nav(user):
     if st.sidebar.button("🚪 Cerrar sesión"):
         st.session_state.auth_user = None
         st.session_state.edit_rec_id = None
-        st.session_state.edit_payload = None
         st.rerun()
 
     return page
@@ -119,10 +116,9 @@ def _shorten(s: str, n: int = 48) -> str:
     return s if len(s) <= n else (s[: n - 1] + "…")
 
 
-# ✅ IMPORTANTE: el cache VA AFUERA de loops/funciones anidadas raras
+# ✅ Cache afuera
 @st.cache_data(show_spinner=False)
 def _cached_extract(sha: str, img_bytes: bytes):
-    # sha se usa como "key" del cache
     return extract_all(img_bytes)
 
 
@@ -172,7 +168,7 @@ def page_carga(user):
                     progress.progress(int(idx / total * 100))
                     continue
 
-            # 2) OCR + extracción (cacheado por SHA)
+            # 2) OCR + extracción
             data = _cached_extract(sha, img_bytes)
 
             # 3) guardar archivo + DB
@@ -207,6 +203,53 @@ def page_carga(user):
 
     status.empty()
     st.success(f"✅ Listo. Cargados: {ok_count} | Duplicados: {dup_count} | Fallidos: {fail_count}")
+
+
+def _can_access(user, rec: Receipt) -> bool:
+    if user is None or rec is None:
+        return False
+    return user.role == "admin" or rec.user_id == user.id
+
+
+def _delete_receipt_and_file(db, rec: Receipt) -> tuple[bool, str]:
+    try:
+        # borrar archivo
+        if rec.image_filename:
+            try:
+                (UPLOAD_DIR / rec.image_filename).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        db.delete(rec)
+        db.commit()
+        return True, "✅ Comprobante eliminado."
+    except Exception as e:
+        db.rollback()
+        return False, f"❌ Error eliminando: {e}"
+
+
+def _update_receipt(db, rec: Receipt, emitter, recipient, amount, currency, date, operation_id) -> tuple[bool, str]:
+    try:
+        rec.emitter = emitter or None
+        rec.recipient = recipient or None
+
+        # amount puede venir vacío -> None
+        if amount is None or str(amount).strip() == "":
+            rec.amount = None
+        else:
+            rec.amount = float(amount)
+
+        rec.currency = currency or None
+        rec.date = date or None
+        rec.operation_id = operation_id or None
+        rec.updated_at = datetime.utcnow()
+
+        db.add(rec)
+        db.commit()
+        return True, "✅ Cambios guardados."
+    except Exception as e:
+        db.rollback()
+        return False, f"❌ Error guardando: {e}"
 
 
 def page_historial(user):
@@ -285,7 +328,7 @@ def page_historial(user):
     st.subheader("📷 Ver comprobante")
 
     ids = sorted(df["id"].dropna().astype(int).unique().tolist())
-    sel_id = st.selectbox("Seleccioná un ID", ids, index=0)
+    sel_id = st.selectbox("Seleccioná un ID", ids, index=0, key="sel_id")
 
     with SessionLocal() as db:
         rec = db.query(Receipt).filter(Receipt.id == int(sel_id)).first()
@@ -294,7 +337,7 @@ def page_historial(user):
         st.error("No se encontró el registro.")
         return
 
-    if user.role != "admin" and rec.user_id != user.id:
+    if not _can_access(user, rec):
         st.error("No tenés permisos para ver este registro.")
         return
 
@@ -337,6 +380,94 @@ def page_historial(user):
                 mime=mime,
             )
 
+    # ======================================================
+    # ✅ EDITAR
+    # ======================================================
+    st.divider()
+    st.subheader("✏️ Editar comprobante")
+
+    with st.form("edit_receipt_form", clear_on_submit=False):
+        emitter = st.text_input("Emisor", value=rec.emitter or "")
+        recipient = st.text_input("Receptor", value=rec.recipient or "")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            amount = st.text_input("Monto", value="" if rec.amount is None else str(rec.amount))
+        with c2:
+            currency = st.selectbox(
+                "Moneda",
+                options=["", "ARS", "PYG", "USD"],
+                index=(["", "ARS", "PYG", "USD"].index(rec.currency) if rec.currency in ["ARS", "PYG", "USD"] else 0),
+            )
+
+        c3, c4 = st.columns(2)
+        with c3:
+            date = st.text_input("Fecha (texto o YYYY-MM-DD)", value=rec.date or "")
+        with c4:
+            operation_id = st.text_input("Operación", value=rec.operation_id or "")
+
+        save_btn = st.form_submit_button("💾 Guardar cambios")
+
+    if save_btn:
+        with SessionLocal() as db:
+            rec_db = db.query(Receipt).filter(Receipt.id == int(sel_id)).first()
+            if not rec_db:
+                st.error("No existe el registro.")
+                st.stop()
+            if not _can_access(user, rec_db):
+                st.error("No tenés permisos para editar este registro.")
+                st.stop()
+
+            ok, msg = _update_receipt(
+                db,
+                rec_db,
+                emitter=emitter.strip(),
+                recipient=recipient.strip(),
+                amount=amount,
+                currency=currency.strip(),
+                date=date.strip(),
+                operation_id=operation_id.strip(),
+            )
+
+        if ok:
+            st.success(msg)
+            time.sleep(0.25)
+            st.rerun()
+        else:
+            st.error(msg)
+
+    # ======================================================
+    # ✅ ELIMINAR 1 POR 1
+    # ======================================================
+    st.divider()
+    st.subheader("🗑️ Eliminar comprobante")
+
+    st.warning("⚠️ Eliminar borra el registro y también el archivo de imagen. No se puede deshacer.")
+    confirm_del = st.checkbox(f"Confirmo eliminar el comprobante ID {sel_id}", key="confirm_del")
+
+    if st.button("🗑️ Eliminar este comprobante", type="primary", disabled=not confirm_del):
+        with SessionLocal() as db:
+            rec_db = db.query(Receipt).filter(Receipt.id == int(sel_id)).first()
+            if not rec_db:
+                st.error("No existe el registro.")
+                st.stop()
+            if not _can_access(user, rec_db):
+                st.error("No tenés permisos para eliminar este registro.")
+                st.stop()
+
+            ok, msg = _delete_receipt_and_file(db, rec_db)
+
+        if ok:
+            st.cache_data.clear()
+            st.success(msg)
+            time.sleep(0.25)
+            st.rerun()
+        else:
+            st.error(msg)
+
+    # ======================================================
+    # EXPORT
+    # ======================================================
     st.divider()
     st.subheader("📦 Exportar a Excel")
 
@@ -370,6 +501,7 @@ def page_historial(user):
 
 def _df_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Data") -> bytes:
     import io
+
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         df.to_excel(writer, index=False, sheet_name=sheet_name)
@@ -401,7 +533,7 @@ def page_admin(user):
     st.dataframe(
         pd.DataFrame(stats, columns=["Usuario", "Cantidad de cargas"]),
         hide_index=True,
-        use_container_width=True
+        use_container_width=True,
     )
 
     st.divider()
