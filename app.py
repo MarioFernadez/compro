@@ -20,7 +20,6 @@ from database import (
 )
 from processor import sha256_bytes, extract_all
 
-
 APP_TITLE = "UTARA - Gestión de Comprobantes"
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -103,6 +102,30 @@ def save_upload(bytes_data: bytes, original_name: str, sha256_hex: str) -> str:
     return filename
 
 
+def _fetch_receipts_for_user(db, user):
+    if user.role == "admin":
+        return db.query(Receipt).order_by(Receipt.created_at.desc()).all()
+
+    return (
+        db.query(Receipt)
+        .filter(Receipt.user_id == user.id)
+        .order_by(Receipt.created_at.desc())
+        .all()
+    )
+
+
+def _shorten(s: str, n: int = 48) -> str:
+    s = "" if s is None else str(s)
+    return s if len(s) <= n else (s[: n - 1] + "…")
+
+
+# ✅ IMPORTANTE: el cache VA AFUERA de loops/funciones anidadas raras
+@st.cache_data(show_spinner=False)
+def _cached_extract(sha: str, img_bytes: bytes):
+    # sha se usa como "key" del cache
+    return extract_all(img_bytes)
+
+
 def page_carga(user):
     if user is None:
         st.warning("Debés iniciar sesión.")
@@ -112,10 +135,9 @@ def page_carga(user):
 
     st.info(
         "Subí imágenes (JPG/PNG). Se detectan duplicados por SHA-256. "
-        "OCR optimizado (recortes + preprocesado) para Mercado Pago."
+        "OCR optimizado para Mercado Pago."
     )
 
-    # ✅ MULTIUPLOAD
     uploads = st.file_uploader(
         "Seleccioná comprobantes",
         type=["jpg", "jpeg", "png"],
@@ -125,7 +147,6 @@ def page_carga(user):
         return
 
     start_btn = st.button("🚀 Procesar archivos", use_container_width=True)
-
     if not start_btn:
         st.caption("Cuando termines de seleccionar, tocá **Procesar archivos**.")
         return
@@ -144,15 +165,17 @@ def page_carga(user):
             img_bytes = uploaded.read()
             sha = sha256_bytes(img_bytes)
 
+            # 1) duplicados (DB)
             with SessionLocal() as db:
                 if sha256_exists(db, sha):
                     dup_count += 1
                     progress.progress(int(idx / total * 100))
                     continue
 
-            # OCR + extracción
-            data = extract_all(img_bytes)
+            # 2) OCR + extracción (cacheado por SHA)
+            data = _cached_extract(sha, img_bytes)
 
+            # 3) guardar archivo + DB
             filename = save_upload(img_bytes, uploaded.name, sha)
 
             with SessionLocal() as db:
@@ -184,23 +207,6 @@ def page_carga(user):
 
     status.empty()
     st.success(f"✅ Listo. Cargados: {ok_count} | Duplicados: {dup_count} | Fallidos: {fail_count}")
-
-
-def _fetch_receipts_for_user(db, user):
-    if user.role == "admin":
-        return db.query(Receipt).order_by(Receipt.created_at.desc()).all()
-
-    return (
-        db.query(Receipt)
-        .filter(Receipt.user_id == user.id)
-        .order_by(Receipt.created_at.desc())
-        .all()
-    )
-
-
-def _shorten(s: str, n: int = 48) -> str:
-    s = "" if s is None else str(s)
-    return s if len(s) <= n else (s[: n - 1] + "…")
 
 
 def page_historial(user):
@@ -392,7 +398,11 @@ def page_admin(user):
     st.subheader("📊 Resumen de cargas por trabajador")
     with SessionLocal() as db:
         stats = count_receipts_by_user(db)
-    st.dataframe(pd.DataFrame(stats, columns=["Usuario", "Cantidad de cargas"]), hide_index=True, use_container_width=True)
+    st.dataframe(
+        pd.DataFrame(stats, columns=["Usuario", "Cantidad de cargas"]),
+        hide_index=True,
+        use_container_width=True
+    )
 
     st.divider()
     st.subheader("👥 Gestión de trabajadores")

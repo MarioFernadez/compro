@@ -1,15 +1,16 @@
 streamlit==1.31.0
-sqlalchemy
-pandas
-xlsxwriter
-bcrypt
-numpy
-pillow
-requests
+sqlalchemy==2.0.25
+pandas==2.2.0
+xlsxwriter==3.1.9
+bcrypt==4.1.2
+numpy==1.26.4
+pillow==10.2.0
+requests==2.31.0
 
 # OCR
 easyocr==1.7.1
+opencv-python-headless==4.9.0.80
 
-# Torch CPU prebuilt (clave para Railway)
+# Torch CPU prebuilt
 torch==2.2.2+cpu
 torchvision==0.17.2+cpu

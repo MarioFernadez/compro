@@ -7,39 +7,35 @@ import json
 import os
 import re
 from dataclasses import dataclass
-from typing import Optional, Tuple, List
-from functools import lru_cache
+from typing import Optional, Tuple
 
 import numpy as np
 from PIL import Image, ImageOps, ImageEnhance
-import requests
 import easyocr
+import requests
 
 # =========================
-# PERF / THREADS (CPU)
+# Performance (CPU)
 # =========================
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
-os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+# Evita que torch se coma todo el CPU y te "cuelgue" Railway
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+os.environ.setdefault("MKL_NUM_THREADS", "2")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "2")
 
-# Directorio fijo para modelos (útil en Docker/Railway)
-# En Docker lo vamos a crear en /app/.easyocr
-os.environ.setdefault("EASYOCR_MODULE_PATH", "/app/.easyocr")
-
-
-# =========================
-# LAZY LOAD READER (NO en import)
-# =========================
-@lru_cache(maxsize=1)
-def get_reader() -> easyocr.Reader:
-    # verbose=False reduce ruido y algo de overhead
-    return easyocr.Reader(["es"], gpu=False, verbose=False)
-
+try:
+    import torch
+    torch.set_num_threads(2)
+except Exception:
+    pass
 
 # =========================
-# MODELO DE DATOS
+# EasyOCR global (1 sola vez)
+# =========================
+EASYOCR_READER = easyocr.Reader(["es"], gpu=False)
+
+# =========================
+# Data model
 # =========================
 @dataclass
 class ExtractedData:
@@ -54,7 +50,7 @@ class ExtractedData:
 
 
 # =========================
-# UTILIDADES
+# Utils
 # =========================
 def sha256_bytes(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
@@ -62,6 +58,10 @@ def sha256_bytes(content: bytes) -> str:
 
 def _clean_spaces(s: str) -> str:
     return " ".join((s or "").strip().split())
+
+
+def _split_lines(text: str):
+    return [l.strip() for l in (text or "").splitlines() if l.strip()]
 
 
 def _looks_like_name(s: str) -> bool:
@@ -86,11 +86,10 @@ def _parse_amount(text: str) -> Optional[float]:
     if not text:
         return None
 
+    # Primero montos con $
     money_candidates = re.findall(r"\$\s*([\d\.,]+)", text)
-    candidates = (
-        money_candidates
-        if money_candidates
-        else re.findall(r"(?<!\d)(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?)(?!\d)", text)
+    candidates = money_candidates if money_candidates else re.findall(
+        r"(?<!\d)(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?)(?!\d)", text
     )
 
     def to_float(s: str) -> Optional[float]:
@@ -122,11 +121,7 @@ def _parse_date(text: str) -> Optional[str]:
     if not text:
         return None
 
-    m = re.search(
-        r"\b(\d{1,2})\s+de\s+([a-záéíóúñ]+)\s+de\s+(\d{4})\b",
-        text,
-        re.IGNORECASE,
-    )
+    m = re.search(r"\b(\d{1,2})\s+de\s+([a-záéíóúñ]+)\s+de\s+(\d{4})\b", text, re.IGNORECASE)
     if m:
         months = {
             "enero": "01", "febrero": "02", "marzo": "03", "abril": "04",
@@ -166,42 +161,33 @@ def _parse_operation_id(text: str) -> Optional[str]:
 
 
 # =========================
-# EMISOR / RECEPTOR (De / Para)
+# Emisor / Receptor ("De" / "Para")
 # =========================
-def _split_lines(text: str) -> List[str]:
-    return [l.strip() for l in (text or "").splitlines() if l.strip()]
-
-
-def _extract_name_after_label(lines: List[str], label: str) -> Optional[str]:
-    label_re = re.compile(rf"^{re.escape(label)}$", re.IGNORECASE)
-
+def _extract_name_after_label(lines, label: str) -> Optional[str]:
+    # Busca "De" o "Para" como línea sola, o "De Nombre"
     for i, line in enumerate(lines):
-        if label_re.fullmatch(line.strip()):
+        if line.strip().lower() == label.lower():
             if i + 1 < len(lines) and _looks_like_name(lines[i + 1]):
                 return _clean_spaces(lines[i + 1])
 
-        m = re.match(rf"^({label})\s+(.+)$", line, re.IGNORECASE)
+        m = re.match(rf"^{label}\s+(.+)$", line, re.IGNORECASE)
         if m:
-            cand = _clean_spaces(m.group(2))
+            cand = _clean_spaces(m.group(1))
             if _looks_like_name(cand):
                 return cand
-
     return None
 
 
-def _extract_two_people_by_cuit(lines: List[str]) -> Tuple[Optional[str], Optional[str]]:
+def _extract_two_people_by_cuit(lines) -> Tuple[Optional[str], Optional[str]]:
+    # Fallback: primera persona con CUIT/CUIL = emisor, segunda = receptor
     person_pattern = re.compile(
-        r"^([A-ZÁÉÍÓÚÑ][A-Za-zÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][A-Za-zÁÉÍÓÚÑáéíóúñ]+)+)\s+.*?(CUIT|CUIL|CUIT/CUIL|CUITCUIL|CUITCUIl)[:\s]*\d{2}[- ]?\d{8}[- ]?\d\b",
+        r"^([A-ZÁÉÍÓÚÑ][A-Za-zÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][A-Za-zÁÉÍÓÚÑáéíóúñ]+)+).*(CUIT|CUIL|CUIT/CUIL).*(\d{2}[- ]?\d{8}[- ]?\d)\b",
         re.IGNORECASE,
     )
 
     persons = []
     for line in lines:
-        line2 = (
-            line.replace("Cuitcuil", "CUIT/CUIL")
-            .replace("CuitCUIL", "CUIT/CUIL")
-            .replace("CuitCuil", "CUIT/CUIL")
-        )
+        line2 = line.replace("Cuitcuil", "CUIT/CUIL").replace("CuitCUIL", "CUIT/CUIL").replace("CuitCuil", "CUIT/CUIL")
         m = person_pattern.search(line2)
         if m:
             name = _clean_spaces(m.group(1))
@@ -217,84 +203,61 @@ def extract_emitter_recipient_from_text(text: str) -> Tuple[Optional[str], Optio
     lines = _split_lines(text)
     emitter = _extract_name_after_label(lines, "De")
     recipient = _extract_name_after_label(lines, "Para")
+
     if emitter or recipient:
         return emitter, recipient
+
     return _extract_two_people_by_cuit(lines)
 
 
 # =========================
-# OCR: PREPROCESO + RECORTES (ACELERA)
+# Image preprocessing
 # =========================
-def _preprocess(img: Image.Image) -> Image.Image:
+def _preprocess_for_ocr(img: Image.Image) -> Image.Image:
+    # Grayscale + autocontrast + sharpen leve (rápido y útil para fotos de celular)
     g = ImageOps.grayscale(img)
     g = ImageOps.autocontrast(g)
     g = ImageEnhance.Sharpness(g).enhance(1.6)
     return g
 
 
-def _resize_max_width(img: Image.Image, max_width: int) -> Image.Image:
-    if img.width <= max_width:
-        return img
-    ratio = max_width / img.width
-    return img.resize((max_width, int(img.height * ratio)))
+# =========================
+# OCR
+# =========================
+def easyocr_extract_text(image: Image.Image, max_width: int) -> str:
+    img = image.copy()
 
+    if img.width > max_width:
+        ratio = max_width / img.width
+        img = img.resize((max_width, int(img.height * ratio)))
 
-def _crop_rel(img: Image.Image, x1: float, y1: float, x2: float, y2: float) -> Image.Image:
-    w, h = img.size
-    return img.crop((int(w * x1), int(h * y1), int(w * x2), int(h * y2)))
+    img = _preprocess_for_ocr(img)
 
+    text = "\n".join(
+        EASYOCR_READER.readtext(np.array(img), detail=0, paragraph=True)
+    )
 
-def _ocr_image(img: Image.Image) -> str:
-    reader = get_reader()
-    arr = np.array(img)
-    text = "\n".join(reader.readtext(arr, detail=0, paragraph=True))
     text = re.sub(r"\b\d{1,2}:\d{2}\b", "", text)
     text = re.sub(r"\bhs\b", "", text, flags=re.IGNORECASE)
-    text = (
-        text.replace("Cuitcuil", "CUIT/CUIL")
-        .replace("CuitCUIL", "CUIT/CUIL")
-        .replace("CuitCuil", "CUIT/CUIL")
-    )
+
+    text = text.replace("Cuitcuil", "CUIT/CUIL").replace("CuitCUIL", "CUIT/CUIL").replace("CuitCuil", "CUIT/CUIL")
     return text
 
 
-def easyocr_extract_text_fast(image: Image.Image) -> Tuple[str, str]:
-    image = _resize_max_width(image, max_width=900)
-    image = _preprocess(image)
-
-    crops = [
-        ("people", _crop_rel(image, 0.06, 0.35, 0.94, 0.75)),
-        ("amount",  _crop_rel(image, 0.05, 0.18, 0.95, 0.40)),
-        ("op",      _crop_rel(image, 0.05, 0.72, 0.95, 0.98)),
-    ]
-
-    quick_parts = []
-    for _, c in crops:
-        quick_parts.append(_ocr_image(c))
-
-    quick_text = "\n".join([p for p in quick_parts if p.strip()])
-
-    em, rc = extract_emitter_recipient_from_text(quick_text)
-    amt = _parse_amount(quick_text)
-    if em and rc and amt:
-        return quick_text, ""
-
-    full_text = _ocr_image(image)
-    return quick_text, full_text
-
-
 # =========================
-# GEMINI (solo si hace falta)
+# Gemini (opcional)
 # =========================
 def gemini_extract_structured(ocr_text: str) -> Optional[dict]:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         return None
-    if os.getenv("GEMINI_DISABLED", "0") == "1":
-        return None
 
     try:
-        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            "gemini-1.5-flash:generateContent"
+        )
+
         payload = {
             "contents": [{
                 "parts": [{
@@ -302,6 +265,13 @@ def gemini_extract_structured(ocr_text: str) -> Optional[dict]:
 Extraé datos de un comprobante (Mercado Pago / Argentina / Paraguay).
 Respondé SOLO JSON válido.
 
+Reglas ESTRICTAS:
+- amount: monto monetario principal (priorizar el que tenga $ o sea el más grande).
+- NO inventar datos.
+- Si el comprobante trae secciones "De" y "Para", ahí están emisor y receptor.
+- operation_id suele estar en "Número de operación".
+
+Formato:
 {{
   "emitter": string|null,
   "recipient": string|null,
@@ -329,50 +299,67 @@ TEXTO OCR:
 
         text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
         return json.loads(text)
+
     except Exception:
         return None
 
 
 # =========================
-# PIPELINE
+# Main pipeline (FAST)
 # =========================
 def extract_all(image_bytes: bytes) -> ExtractedData:
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    data = ExtractedData()
 
-    quick_text, full_text = easyocr_extract_text_fast(image)
-    ocr_text = (full_text or quick_text or "").strip()
+    # 1) OCR rápido
+    ocr_fast = easyocr_extract_text(image, max_width=1024)
 
-    data = ExtractedData(raw_text=ocr_text)
+    # reglas rápidas
+    em, rec = extract_emitter_recipient_from_text(ocr_fast)
+    amt = _parse_amount(ocr_fast)
+    cur = _normalize_currency(ocr_fast)
+    dte = _parse_date(ocr_fast)
+    opid = _parse_operation_id(ocr_fast)
 
-    rule_emitter, rule_recipient = extract_emitter_recipient_from_text(ocr_text)
-    rule_amount = _parse_amount(ocr_text)
-    rule_currency = _normalize_currency(ocr_text)
-    rule_date = _parse_date(ocr_text)
-    rule_operation_id = _parse_operation_id(ocr_text)
+    # Si faltan personas, hacemos OCR "lento" (mejor calidad)
+    if not em or not rec:
+        ocr_slow = easyocr_extract_text(image, max_width=1600)
+        em2, rec2 = extract_emitter_recipient_from_text(ocr_slow)
+        amt2 = _parse_amount(ocr_slow) or amt
+        cur2 = _normalize_currency(ocr_slow) or cur
+        dte2 = _parse_date(ocr_slow) or dte
+        opid2 = _parse_operation_id(ocr_slow) or opid
 
-    data.emitter = rule_emitter
-    data.recipient = rule_recipient
-    data.amount = rule_amount
-    data.currency = rule_currency
-    data.date = rule_date
-    data.operation_id = rule_operation_id
+        # merge
+        em = em or em2
+        rec = rec or rec2
+        amt = amt2
+        cur = cur2
+        dte = dte2
+        opid = opid2
 
-    need_ai = (data.emitter is None or data.recipient is None or data.amount is None)
-    if need_ai:
-        structured = gemini_extract_structured(ocr_text)
-        if structured:
-            data.emitter = structured.get("emitter") or data.emitter
-            data.recipient = structured.get("recipient") or data.recipient
-            if structured.get("amount") is not None:
-                data.amount = structured.get("amount")
-            data.currency = structured.get("currency") or data.currency
-            data.date = structured.get("date") or data.date
-            data.operation_id = structured.get("operation_id") or data.operation_id
-            data.extracted_json = json.dumps(structured, ensure_ascii=False)
-            return data
+        data.raw_text = ocr_slow
+    else:
+        data.raw_text = ocr_fast
 
-    data.extracted_json = json.dumps(
-        {"source": "rules_fast", "raw_text": ocr_text},
-        ensure_ascii=False,
-    )
+    # (Opcional) Gemini solo si querés "mejorar" y hay API, pero puede tardar
+    structured = gemini_extract_structured(data.raw_text or "")
+    if structured:
+        data.emitter = structured.get("emitter") or em
+        data.recipient = structured.get("recipient") or rec
+        data.amount = structured.get("amount") if structured.get("amount") is not None else amt
+        data.currency = structured.get("currency") or cur
+        data.date = structured.get("date") or dte
+        data.operation_id = structured.get("operation_id") or opid
+        data.extracted_json = json.dumps(structured, ensure_ascii=False)
+        return data
+
+    # reglas
+    data.emitter = em
+    data.recipient = rec
+    data.amount = amt
+    data.currency = cur
+    data.date = dte
+    data.operation_id = opid
+    data.extracted_json = json.dumps({"source": "rules", "raw_text": data.raw_text}, ensure_ascii=False)
     return data
