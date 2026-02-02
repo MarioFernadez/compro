@@ -8,27 +8,34 @@ import os
 import re
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
+from functools import lru_cache
 
 import numpy as np
 from PIL import Image, ImageOps, ImageEnhance
-import easyocr
 import requests
+import easyocr
 
 # =========================
 # PERF / THREADS (CPU)
 # =========================
-# Reduce “sobre-threading” en containers chicos (Railway)
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
+# Directorio fijo para modelos (útil en Docker/Railway)
+# En Docker lo vamos a crear en /app/.easyocr
+os.environ.setdefault("EASYOCR_MODULE_PATH", "/app/.easyocr")
+
+
 # =========================
-# EASYOCR (init 1 sola vez)
+# LAZY LOAD READER (NO en import)
 # =========================
-# verbose=False reduce logs y un poquito overhead
-EASYOCR_READER = easyocr.Reader(["es"], gpu=False, verbose=False)
+@lru_cache(maxsize=1)
+def get_reader() -> easyocr.Reader:
+    # verbose=False reduce ruido y algo de overhead
+    return easyocr.Reader(["es"], gpu=False, verbose=False)
 
 
 # =========================
@@ -122,19 +129,10 @@ def _parse_date(text: str) -> Optional[str]:
     )
     if m:
         months = {
-            "enero": "01",
-            "febrero": "02",
-            "marzo": "03",
-            "abril": "04",
-            "mayo": "05",
-            "junio": "06",
-            "julio": "07",
-            "agosto": "08",
-            "septiembre": "09",
-            "setiembre": "09",
-            "octubre": "10",
-            "noviembre": "11",
-            "diciembre": "12",
+            "enero": "01", "febrero": "02", "marzo": "03", "abril": "04",
+            "mayo": "05", "junio": "06", "julio": "07", "agosto": "08",
+            "septiembre": "09", "setiembre": "09",
+            "octubre": "10", "noviembre": "11", "diciembre": "12",
         }
         day = str(m.group(1)).zfill(2)
         month = months.get(m.group(2).lower(), "01")
@@ -157,13 +155,9 @@ def _parse_operation_id(text: str) -> Optional[str]:
         if m:
             return m.group(1)
 
-    m2 = re.search(
-        r"N[ÚU]MERO\s+DE\s+OPERACI[ÓO]N(?:\s+DE\s+MERCADO\s+PAGO)?",
-        text,
-        re.IGNORECASE,
-    )
+    m2 = re.search(r"N[ÚU]MERO\s+DE\s+OPERACI[ÓO]N(?:\s+DE\s+MERCADO\s+PAGO)?", text, re.IGNORECASE)
     if m2:
-        tail = text[m2.end() :]
+        tail = text[m2.end():]
         m3 = re.search(r"\b(\d{6,})\b", tail)
         if m3:
             return m3.group(1)
@@ -223,18 +217,15 @@ def extract_emitter_recipient_from_text(text: str) -> Tuple[Optional[str], Optio
     lines = _split_lines(text)
     emitter = _extract_name_after_label(lines, "De")
     recipient = _extract_name_after_label(lines, "Para")
-
     if emitter or recipient:
         return emitter, recipient
-
     return _extract_two_people_by_cuit(lines)
 
 
 # =========================
-# OCR: PREPROCESADO + RECORTES (ACELERA MUCHO)
+# OCR: PREPROCESO + RECORTES (ACELERA)
 # =========================
 def _preprocess(img: Image.Image) -> Image.Image:
-    # Grayscale + autocontrast + sharpen suave
     g = ImageOps.grayscale(img)
     g = ImageOps.autocontrast(g)
     g = ImageEnhance.Sharpness(g).enhance(1.6)
@@ -254,8 +245,9 @@ def _crop_rel(img: Image.Image, x1: float, y1: float, x2: float, y2: float) -> I
 
 
 def _ocr_image(img: Image.Image) -> str:
+    reader = get_reader()
     arr = np.array(img)
-    text = "\n".join(EASYOCR_READER.readtext(arr, detail=0, paragraph=True))
+    text = "\n".join(reader.readtext(arr, detail=0, paragraph=True))
     text = re.sub(r"\b\d{1,2}:\d{2}\b", "", text)
     text = re.sub(r"\bhs\b", "", text, flags=re.IGNORECASE)
     text = (
@@ -267,18 +259,9 @@ def _ocr_image(img: Image.Image) -> str:
 
 
 def easyocr_extract_text_fast(image: Image.Image) -> Tuple[str, str]:
-    """
-    Devuelve: (text_quick, text_full_if_needed)
-
-    Estrategia:
-    - OCR rápido por recortes (zona De/Para + zona Monto + zona Operación)
-    - SOLO si faltan campos, hace OCR completo (más lento)
-    """
-    # Mucho más rápido en CPU
     image = _resize_max_width(image, max_width=900)
     image = _preprocess(image)
 
-    # Recortes típicos para MercadoPago (pantalla)
     crops = [
         ("people", _crop_rel(image, 0.06, 0.35, 0.94, 0.75)),
         ("amount",  _crop_rel(image, 0.05, 0.18, 0.95, 0.40)),
@@ -291,14 +274,11 @@ def easyocr_extract_text_fast(image: Image.Image) -> Tuple[str, str]:
 
     quick_text = "\n".join([p for p in quick_parts if p.strip()])
 
-    # Chequeo rápido: si ya tenemos lo esencial, evitamos OCR completo
     em, rc = extract_emitter_recipient_from_text(quick_text)
     amt = _parse_amount(quick_text)
+    if em and rc and amt:
+        return quick_text, ""
 
-    if (em and rc and amt):
-        return quick_text, ""  # full no necesario
-
-    # OCR completo solo si faltan datos
     full_text = _ocr_image(image)
     return quick_text, full_text
 
@@ -310,28 +290,17 @@ def gemini_extract_structured(ocr_text: str) -> Optional[dict]:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         return None
-
-    # Si querés forzar desactivar Gemini (para máxima velocidad):
-    # export GEMINI_DISABLED=1
     if os.getenv("GEMINI_DISABLED", "0") == "1":
         return None
 
     try:
         url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
         payload = {
-            "contents": [
-                {
-                    "parts": [
-                        {
-                            "text": f"""
+            "contents": [{
+                "parts": [{
+                    "text": f"""
 Extraé datos de un comprobante (Mercado Pago / Argentina / Paraguay).
 Respondé SOLO JSON válido.
-
-Reglas:
-- amount: monto principal (priorizar el que tenga $ o sea el más grande).
-- Emisor/Receptor: suelen estar en "De" y "Para".
-- operation_id: suele estar en "Número de operación".
-- NO inventar.
 
 {{
   "emitter": string|null,
@@ -345,17 +314,15 @@ Reglas:
 TEXTO OCR:
 {ocr_text}
 """
-                        }
-                    ]
-                }
-            ]
+                }]
+            }]
         }
 
         r = requests.post(
             f"{url}?key={api_key}",
             json=payload,
             headers={"Content-Type": "application/json"},
-            timeout=18,  # menor timeout para no colgar
+            timeout=18,
         )
         if r.status_code != 200:
             return None
@@ -373,12 +340,10 @@ def extract_all(image_bytes: bytes) -> ExtractedData:
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
     quick_text, full_text = easyocr_extract_text_fast(image)
-
-    # Texto final para debug (preferimos full si existe)
     ocr_text = (full_text or quick_text or "").strip()
+
     data = ExtractedData(raw_text=ocr_text)
 
-    # Reglas locales (rápidas)
     rule_emitter, rule_recipient = extract_emitter_recipient_from_text(ocr_text)
     rule_amount = _parse_amount(ocr_text)
     rule_currency = _normalize_currency(ocr_text)
@@ -392,7 +357,6 @@ def extract_all(image_bytes: bytes) -> ExtractedData:
     data.date = rule_date
     data.operation_id = rule_operation_id
 
-    # Gemini SOLO si falta algo importante (para acelerar)
     need_ai = (data.emitter is None or data.recipient is None or data.amount is None)
     if need_ai:
         structured = gemini_extract_structured(ocr_text)
