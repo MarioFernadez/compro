@@ -1,3 +1,4 @@
+# requirements.txt
 streamlit==1.31.0
 sqlalchemy
 pandas
@@ -10,6 +11,6 @@ requests
 # OCR
 easyocr==1.7.1
 
-# Torch CPU prebuilt (clave para Railway)
+# Torch CPU prebuilt (Railway)
 torch==2.2.2+cpu
 torchvision==0.17.2+cpu
