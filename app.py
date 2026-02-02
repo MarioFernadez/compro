@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -118,84 +119,11 @@ def _shorten(s: str, n: int = 48) -> str:
     return s if len(s) <= n else (s[: n - 1] + "…")
 
 
-# ✅ cache fuera de loops
+# ✅ IMPORTANTE: el cache VA AFUERA de loops/funciones anidadas raras
 @st.cache_data(show_spinner=False)
 def _cached_extract(sha: str, img_bytes: bytes):
+    # sha se usa como "key" del cache
     return extract_all(img_bytes)
-
-
-# =========================
-# BORRADO (1 y masivo)
-# =========================
-def _delete_receipt(user, receipt_id: int) -> bool:
-    """
-    Borra un comprobante:
-    - valida permisos (admin o dueño)
-    - borra archivo del disco si existe
-    - borra registro en DB
-    """
-    if user is None:
-        st.error("No hay sesión activa.")
-        return False
-
-    with SessionLocal() as db:
-        rec = db.query(Receipt).filter(Receipt.id == int(receipt_id)).first()
-        if not rec:
-            st.error("No existe ese ID.")
-            return False
-
-        if user.role != "admin" and rec.user_id != user.id:
-            st.error("No tenés permisos para eliminar este registro.")
-            return False
-
-        try:
-            img_path = UPLOAD_DIR / (rec.image_filename or "")
-            img_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-        db.delete(rec)
-        db.commit()
-
-    return True
-
-
-def _delete_all_receipts_for_scope(user) -> tuple[int, int]:
-    """
-    Elimina masivamente:
-    - admin: borra TODOS los comprobantes
-    - worker: borra SOLO sus comprobantes
-
-    Retorna: (borrados_db, archivos_borrados)
-    """
-    if user is None:
-        raise ValueError("No hay sesión activa.")
-
-    deleted_db = 0
-    deleted_files = 0
-
-    with SessionLocal() as db:
-        q = db.query(Receipt)
-        if user.role != "admin":
-            q = q.filter(Receipt.user_id == user.id)
-
-        receipts = q.all()
-
-        for rec in receipts:
-            try:
-                img_path = UPLOAD_DIR / (rec.image_filename or "")
-                if img_path.exists():
-                    img_path.unlink(missing_ok=True)
-                    deleted_files += 1
-            except Exception:
-                pass
-
-            db.delete(rec)
-            deleted_db += 1
-
-        db.commit()
-
-    return deleted_db, deleted_files
 
 
 def page_carga(user):
@@ -409,52 +337,6 @@ def page_historial(user):
                 mime=mime,
             )
 
-    # =========================
-    # ELIMINAR (1 y masivo)
-    # =========================
-    st.divider()
-    st.subheader("🗑️ Eliminar comprobantes")
-
-    tab1, tab2 = st.tabs(["Eliminar 1 por 1", "Eliminar TODO"])
-
-    with tab1:
-        st.caption("Elimina un comprobante específico por ID.")
-        del_id = st.number_input("ID a eliminar", min_value=1, step=1, value=int(sel_id))
-        confirm_one = st.checkbox("Confirmo eliminar este comprobante", key="confirm_one")
-
-        if st.button("🗑️ Eliminar este comprobante", disabled=not confirm_one, use_container_width=True):
-            ok = _delete_receipt(user, int(del_id))
-            if ok:
-                st.success("✅ Comprobante eliminado.")
-                st.rerun()
-
-    with tab2:
-        if user.role == "admin":
-            st.warning("⚠️ Como ADMIN, esto elimina **TODOS** los comprobantes del sistema.")
-            scope_text = "TODOS los comprobantes del sistema"
-        else:
-            st.warning("⚠️ Esto elimina **TODOS tus** comprobantes (solo los tuyos).")
-            scope_text = "TODOS tus comprobantes"
-
-        st.caption(f"Alcance: **{scope_text}**")
-
-        confirm_all_1 = st.checkbox("Entiendo que esta acción es irreversible", key="confirm_all_1")
-        confirm_all_2 = st.text_input(
-            "Escribí EXACTAMENTE: ELIMINAR TODO",
-            placeholder="ELIMINAR TODO",
-            key="confirm_all_2"
-        )
-
-        allow_delete_all = bool(confirm_all_1 and confirm_all_2.strip().upper() == "ELIMINAR TODO")
-
-        if st.button("🔥 Eliminar TODO", disabled=not allow_delete_all, use_container_width=True):
-            deleted_db, deleted_files = _delete_all_receipts_for_scope(user)
-            st.success(f"✅ Eliminación masiva completa. Registros borrados: {deleted_db} | Archivos borrados: {deleted_files}")
-            st.rerun()
-
-    # =========================
-    # EXPORT
-    # =========================
     st.divider()
     st.subheader("📦 Exportar a Excel")
 
